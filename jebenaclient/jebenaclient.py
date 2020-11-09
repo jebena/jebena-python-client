@@ -80,6 +80,7 @@ def run_query(
         api_key_name: str = None,
         api_secret_key: str = None,
         allow_insecure_https: bool = False,
+        return_instead_of_raise_on_errors: bool = False
 ) -> dict:
     """Send a GQL query to the Jebena API Server and return the server reply.
 
@@ -103,6 +104,9 @@ def run_query(
 
     :param allow_insecure_https: When true, allow self-signed SSL certificates.
     For localhost-based endpoints, this will automatically flip to True.
+
+    :param return_instead_of_raise_on_errors: When true, return the GQL response
+    and assume that the caller will inspect for errors, instead of raising.
 
     :return: GQL response as a Python dict
     """
@@ -177,22 +181,24 @@ def run_query(
         api_secret_key=api_secret_key
     )
 
-    if "errors" in parsed_response:
-        error_messages = []
-        for error in parsed_response["errors"]:
-            error_messages.append(error["message"])
-            LOGGER.error(
-                "GQL query returned error:\n%s\n"
-                "Original query was:\n%s\n"
-                "For GraphQL schema, see Docs tab at %sdocs/graphiql",
-                error["message"],
-                query,
-                api_endpoint
-            )
-        raise JebenaCliGQLException(
-            f"GQL errors encountered ({'; '.join(error_messages)[0:512]})"
-        )
-    # Success!
+    if not return_instead_of_raise_on_errors:
+        if "errors" in parsed_response:
+            error_messages = []
+            for error in parsed_response["errors"]:
+                error_messages.append(error["message"])
+                LOGGER.error(
+                    "GQL query returned error:\n%s\n"
+                    "Original query was:\n%s\n"
+                    "For GraphQL schema, see Docs tab at %sdocs/graphiql",
+                    error["message"],
+                    query,
+                    api_endpoint
+                )
+                raise JebenaCliGQLException(
+                    f"GQL errors encountered ({'; '.join(error_messages)[0:512]})"
+                )
+
+    # Return GQL response:
     return parsed_response
 
 
