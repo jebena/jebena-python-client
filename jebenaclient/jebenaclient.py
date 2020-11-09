@@ -462,6 +462,9 @@ def main():
     except KeyboardInterrupt:
         print("", file=sys.stderr)
         sys.exit(99)
+    except JebenaCliMissingKeyException:
+        print(f"Jebena API Keys missing; see https://github.com/jebena/jebena-python-client/blob/main/README.md")
+        sys.exit(99)
     except JebenaCliGQLException as exc:
         print(f"Jebena GQL Query Exception: {exc}", file=sys.stderr)
         sys.exit(1)
