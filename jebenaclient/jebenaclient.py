@@ -209,6 +209,7 @@ def _execute_gql_query(
         allow_insecure_https: bool = False,
         api_key_name: str = None,
         api_secret_key: str = None,
+        retries_allowed: int = 2
 ) -> dict:
     """Send a GQL query to the server and return the GQL response."""
     if not api_key_name:
@@ -247,11 +248,11 @@ def _execute_gql_query(
 
     # Send and return response -- with a short retry / delay loop to give some
     # support to network hiccups, server rate-limiting, or individual backend-node issues.
-    attempts_allowed = 3
+    attempts_allowed = 1 + retries_allowed
     attempts_tried = 0
-    retry_delay_constant_delay = 1
+    retry_delay_constant_delay = 5
     retry_delay_next_attempt_extra_delay = 0
-    retry_delay_factor = 2
+    retry_delay_factor = 3
 
     def _log_and_raise_or_retry(log_message: str, *args) -> None:
         """Log error and either return if retries allowed or raise."""
@@ -328,7 +329,7 @@ def _execute_gql_query(
                     "Jebena API Server %s has rate-limited the request.",
                     api_endpoint
                 )
-                retry_delay_next_attempt_extra_delay = 5
+                retry_delay_next_attempt_extra_delay = 10
                 continue
 
             # Response document may be a Jebena API Server response with info:
