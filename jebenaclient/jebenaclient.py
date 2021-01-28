@@ -43,8 +43,9 @@ Queries with variables are also supported by "wrapping" your query like so:
 # 0.5.0  20200825: Updates for splitting jebena_cli.py into a stand-alone package. -JP
 # 0.6.0  20201030: Various small fixes, including multi-line support of wrapped queries. -JP
 # 0.7.0  20201221: Address issues as flagged in GH (don't retry mutations; better error handling). -JP
+# 0.7.1  20210128: Address socket timeout issue. -JP
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 import http.client
 import json
