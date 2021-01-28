@@ -321,7 +321,9 @@ def _execute_gql_query(
             context = None
             if allow_insecure_https:
                 context = ssl.SSLContext()
-            connection_timeout_in_seconds = 10
+            # Set an upper-bound to prevent process hangs on network issues, otherwise clients can
+            # hang indefinitely in certain network conditions:
+            connection_timeout_in_seconds = 300
             # NB: Mark urlopen() call with 'nosec' to acknowledge handling file:/ condition:
             LOGGER.debug("Calling urllib.request.urlopen(...)")
             response = urllib.request.urlopen(
