@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# While we call for python3, we do need to support Python 2.7 for a bit longer:
+from __future__ import print_function
+
 """
 A very simply GQL Client for the Jebena API Server.
 
@@ -44,8 +48,8 @@ Queries with variables are also supported by "wrapping" your query like so:
 # 0.6.0  20201030: Various small fixes, including multi-line support of wrapped queries. -JP
 # 0.7.0  20201221: Address issues as flagged in GH (don't retry mutations; better error handling). -JP
 # 0.7.1  20210128: Address socket timeout issue. -JP
-
-__version__ = "0.7.1"
+# 0.8.0  20210204: Make script Python 2.7 compatible. :-(  -JP
+__version__ = "0.8.0"
 
 import http.client
 import json
@@ -56,10 +60,19 @@ import socket
 import ssl
 import sys
 import time
-import urllib.request
 from threading import Timer
-from typing import NoReturn
-from urllib.parse import urlparse
+
+# Python 2 compatability:
+try:
+    from urllib.parse import urlparse
+except ImportError:
+     from urlparse import urlparse
+try:
+    import urllib.request as urllib_request
+    from urllib.request import urlopen
+except ImportError:
+    import urllib2 as urllib_request
+    from urllib2 import urlopen
 
 LOGGER = logging.getLogger("jebenaclient")
 
@@ -81,15 +94,16 @@ class JebenaCliGQLPermissionDenied(JebenaCliException):
 
 
 def run_query(
-        query: str,
-        variables=None,
-        api_endpoint: str = None,
-        api_key_name: str = None,
-        api_secret_key: str = None,
-        allow_insecure_https: bool = False,
-        return_instead_of_raise_on_errors: bool = False,
-        skip_logging_transient_errors: bool = False
-) -> dict:
+        query,
+        variables = None,
+        api_endpoint = None,
+        api_key_name = None,
+        api_secret_key = None,
+        allow_insecure_https = False,
+        return_instead_of_raise_on_errors = False,
+        skip_logging_transient_errors = False
+):
+    # type: (str, dict, str, str, str, bool, bool, bool) -> dict
     """Send a GQL query to the Jebena API Server and return the server reply.
 
     OS Environ variables should be set for JEBENA_API_KEY_NAME, JEBENA_API_SECRET_KEY,
@@ -152,7 +166,7 @@ def run_query(
 
     # Make sure our API endpoint ends with the expected trailing slash:
     if api_endpoint[-1] != "/":
-        raise JebenaCliException(f"JEBENA_API_ENDPOINT missing trailing slash {api_endpoint[:-1]}")
+        raise JebenaCliException("JEBENA_API_ENDPOINT missing trailing slash")
 
     # Always allow insecure connections when connecting to localhost:
     is_api_endpoint_public = False
@@ -164,7 +178,7 @@ def run_query(
                 is_api_endpoint_public = True
     except Exception as exc:
         raise JebenaCliException(
-            f"Unable to find Jebena API Server at endpoint '{api_endpoint}' ({exc})"
+            "Unable to find Jebena API Server at endpoint '%s' (%s)" % (api_endpoint, exc)
         )
     if not is_api_endpoint_public:
         allow_insecure_https = True
@@ -181,7 +195,8 @@ def run_query(
                 query = wrapped_query["query"]
             if "variables" in wrapped_query:
                 variables = wrapped_query["variables"]
-        except json.decoder.JSONDecodeError:
+        except Exception:
+            # For Python 2 compatability: don't try to catch 'json.decoder.JSONDecodeError'
             pass
 
     parsed_response = _execute_gql_query(
@@ -220,7 +235,7 @@ def run_query(
                 )
             LOGGER.error("For GraphQL schema, see Docs tab at %sdocs/graphiql", api_endpoint)
             raise exception_type(
-                f"GQL errors encountered ({'; '.join(error_messages)[0:512]})"
+                "GQL errors encountered (%s)" % '; '.join(error_messages)[0:512]
             )
 
     # Return GQL response:
@@ -228,15 +243,16 @@ def run_query(
 
 
 def _execute_gql_query(
-        api_endpoint: str,
-        query: str,
-        variables: dict = None,
-        allow_insecure_https: bool = False,
-        api_key_name: str = None,
-        api_secret_key: str = None,
-        retries_allowed: int = 2,
-        skip_logging_transient_errors: bool = False
-) -> dict:
+        api_endpoint,
+        query,
+        variables = None,
+        allow_insecure_https = False,
+        api_key_name = None,
+        api_secret_key = None,
+        retries_allowed = 2,
+        skip_logging_transient_errors = False
+):
+    # type: (str, str, dict, bool, str, str, int, bool) -> dict
     """Send a GQL query to the server and return the GQL response."""
     if not api_key_name:
         raise JebenaCliMissingKeyException("Missing API Key Name (Try setting ENV variable JEBENA_API_KEY_NAME)")
@@ -250,26 +266,27 @@ def _execute_gql_query(
     }
     headers = {
         "Accept": "application/json",
-        "Authorization":  f"ApiKey {api_key_name}/{api_secret_key}",
+        "Authorization":  "ApiKey %s/%s" % (api_key_name, api_secret_key),
         "Content-Type": "application/json",
-        "User-Agent": f"jebena-cli-tool/{__version__}",
+        "User-Agent": "jebena-cli-tool/%s" % __version__,
     }
     is_query_a_mutation = False
-    if query.split(maxsplit=2)[0].lower() == 'mutation':
+    if query.split(None, 2)[0].lower() == 'mutation':
+        # In split() 'None' is separtor of whitespace and 2 is maxsplit; avoid kwargs for Python 2
         is_query_a_mutation = True
     try:
         request_payload = json.dumps(data).encode("utf-8")
     except TypeError as exc:
-        raise JebenaCliException(f"Invalid input (unable to create JSON; {exc})")
+        raise JebenaCliException("Invalid input (unable to create JSON; %s)" % exc)
 
     # Ensure our endpoint is not a file:/ path:
     if api_endpoint[0:4].lower() != "http":
-        raise JebenaCliException(f"Invalid API Endpoint '{api_endpoint}'")
+        raise JebenaCliException("Invalid API Endpoint %s" % api_endpoint)
     # By convention, our gql access point is under a sub-path of the API endpoint:
-    gql_endpoint = f"{api_endpoint}gql/"
+    gql_endpoint = "%sgql/" % api_endpoint
     LOGGER.debug("Request URL: %s", gql_endpoint)
     LOGGER.debug("Request body:\n%s\n", request_payload)
-    req = urllib.request.Request(
+    req = urllib_request.Request(
         gql_endpoint,
         data=request_payload,
         headers=headers
@@ -286,7 +303,8 @@ def _execute_gql_query(
     retry_delay_next_attempt_extra_delay = 0
     retry_delay_factor = 3
 
-    def _log_and_raise_or_retry(log_message: str, *args) -> None:
+    def _log_and_raise_or_retry(log_message, *args):
+        # type: (str) -> None
         """Log error and either return if retries allowed or raise."""
         if attempts_tried < attempts_allowed:
             if not skip_logging_transient_errors:
@@ -294,7 +312,8 @@ def _execute_gql_query(
             return
         _log_and_raise(log_message, *args)
 
-    def _log_and_raise(log_message: str, *args) -> NoReturn:
+    def _log_and_raise(log_message, *args):
+        # type: (str) -> NoReturn
         """Log error and raise now."""
         if not skip_logging_transient_errors:
             LOGGER.error(log_message, *args)
@@ -326,26 +345,26 @@ def _execute_gql_query(
             # hang indefinitely in certain network conditions:
             connection_timeout_in_seconds = 300
             # NB: Mark urlopen() call with 'nosec' to acknowledge handling file:/ condition:
-            LOGGER.debug("Calling urllib.request.urlopen(...)")
-            response = urllib.request.urlopen(
+            LOGGER.debug("Calling urlopen(...)")
+            response = urlopen(
                 req,
                 context=context,
                 timeout=connection_timeout_in_seconds
             )  # nosec
-            LOGGER.debug("Finished urllib.request.urlopen(...)")
+            LOGGER.debug("Finished urlopen(...)")
             try:
                 response_string = response.read().decode("utf-8")
             except Exception as exc:
                 raise JebenaCliException(
-                    f"Invalid response from {api_endpoint} ({exc})"
+                    "Invalid response from %s (%s)" % (api_endpoint, exc)
                 )
             try:
                 return json.loads(response_string)
             except json.decoder.JSONDecodeError:
                 LOGGER.debug("Unable to decode response string:\n%s", response_string)
                 raise JebenaCliGQLException(
-                    f"Invalid GQL response from {api_endpoint} "
-                    f"(unable to parse JSON: '{response_string[0:128]}...')"
+                    "Invalid GQL response from %s (unable to parse JSON: '%s...')" %
+                    (api_endpoint, response_string[0:128])
                 )
 
         except socket.timeout:
@@ -430,17 +449,18 @@ def _execute_gql_query(
     # We shouldn't actually ever hit this condition, based on our above try/catch code,
     # but any programming error above could lead to falling off of the edge:
     raise JebenaCliException(
-        f"Unknown client issue when connection to Jebena API Server at {api_endpoint}"
+        "Unknown client issue when connection to Jebena API Server at %s" % api_endpoint
     )
 
 
-def read_query_and_return_response() -> str:
+def read_query_and_return_response():
+    # type: () -> str
     """Read a query from STDIN (prompting if necessary) and return the API server's response."""
     try:
         gql_query = read_from_stdin(
             user_prompt="Enter your GQL query, followed by return and "
                         "either Ctrl-D or . and another return.\n"
-                        f"For API documentation, point a web browser at your API endpoint.\n"
+                        "For API documentation, point a web browser at your API endpoint.\n"
                         "Example query:  query { me { person { displayName } } }\n"
             )
         gql_variables = None
@@ -453,14 +473,13 @@ def read_query_and_return_response() -> str:
     return json.dumps(gql_response, indent=2, sort_keys=True)
 
 
-def read_from_stdin(
-        user_prompt: str = None
-) -> str:
+def read_from_stdin(user_prompt = None):
+    # type: (str) -> str
     """Read from stdin until Ctrl-D, "." on empty line, or EOF occurs."""
     # If in a terminal, print some opening help:
     if sys.stdin.isatty() and user_prompt is not None:
         for line in user_prompt.split("\n"):
-            print(f"\033[37m{line}\033[0m", file=sys.stderr)
+            print("\033[37m" + line + "\033[0m", file=sys.stderr)
     reads = []
     needs_newline_at_close = False
     while True:
@@ -513,13 +532,13 @@ def main():
         print("", file=sys.stderr)
         sys.exit(99)
     except JebenaCliMissingKeyException:
-        print(f"Jebena API Keys missing; see https://github.com/jebena/jebena-python-client/blob/main/README.md")
+        print("Jebena API Keys missing; see https://github.com/jebena/jebena-python-client/blob/main/README.md")
         sys.exit(99)
     except JebenaCliGQLException as exc:
-        print(f"Jebena GQL Query Exception: {exc}", file=sys.stderr)
+        print("Jebena GQL Query Exception: %s" % exc, file=sys.stderr)
         sys.exit(1)
     except JebenaCliException as exc:
-        print(f"Jebena GQL Client Error: {exc}", file=sys.stderr)
+        print("Jebena GQL Client Error: %s" % exc, file=sys.stderr)
         sys.exit(2)
     finally:
         watcher.cancel()
