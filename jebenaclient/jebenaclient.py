@@ -13,16 +13,16 @@ Key features:
 The simplest way to run the client is to directly run python:
     1. Set up your ENV variables with JEBENA_API_KEY_NAME,
        JEBENA_API_SECRET_KEY, and JEBENA_API_ENDPOINT.
-    2. python ./jebena_cli.py
+    2. python ./jebenaclient.py
     3. Enter your GQL query as prompted.
 
 You can also use this script directly in Python:
-    from jebena_cli import run_query
+    from jebenaclient import run_query
     gql_query_string = "query { me { person { displayName } } }"
     run_query(gql_query_string)
 
 Variables can be passed in as well:
-    from jebena_cli import run_query
+    from jebenaclient import run_query
     run_query(gql_query_string, variables=...)
 
 For GQL Schema help, see documentation on the Jebena API Server
