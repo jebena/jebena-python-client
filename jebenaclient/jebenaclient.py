@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3  # noqa -- the hash-bang line here allows for direct script execution
 
 # While we call for python3, we do need to support Python 2.7 for a bit longer:
 from __future__ import print_function
@@ -40,16 +40,21 @@ Queries with variables are also supported by "wrapping" your query like so:
 """
 
 # Version history:
-# 0.1.0  20191121: Quick initial implementation, to get things rolling. -JP
-# 0.2.0  20200222: Better error handling and python clean-up. -JP
-# 0.3.0  20200409: Minor updates to include version number in user-agent and script timeout. -JP
-# 0.4.0  20200719: Minor logging / timeout changes for rate limiting; flake8 fixes. -JP
-# 0.5.0  20200825: Updates for splitting jebena_cli.py into a stand-alone package. -JP
-# 0.6.0  20201030: Various small fixes, including multi-line support of wrapped queries. -JP
-# 0.7.0  20201221: Address issues as flagged in GH (don't retry mutations; better error handling). -JP
-# 0.7.1  20210128: Address socket timeout issue. -JP
-# 0.8.0  20210204: Make script Python 2.7 compatible. :-(  -JP
-__version__ = "0.8.0"
+# 0.1.0  20191121: Quick initial implementation, to get things rolling.
+# 0.2.0  20200222: Better error handling and python clean-up.
+# 0.3.0  20200409: Minor updates to include version number in user-agent
+#                  and script timeout.
+# 0.4.0  20200719: Minor logging / timeout changes for rate limiting;
+#                  flake8 fixes.
+# 0.5.0  20200825: Updates for splitting jebena_cli.py into a stand-alone package.
+# 0.6.0  20201030: Various small fixes, including multi-line
+#                  support of wrapped queries.
+# 0.7.0  20201221: Address issues as flagged in GH (don't retry mutations;
+#                  better error handling).
+# 0.7.1  20210128: Address socket timeout issue.
+# 0.8.0  20210204: Make script Python 2.7 compatible.
+# 0.8.1  20210217: Handle some flake8 / mypy issues in a Py 2.7 compatible way.
+__version__ = "0.8.1"
 
 import http.client
 import json
@@ -62,11 +67,11 @@ import sys
 import time
 from threading import Timer
 
-# Python 2 compatability:
+# Python 2 compatibility:
 try:
     from urllib.parse import urlparse
 except ImportError:
-     from urlparse import urlparse
+    from urlparse import urlparse
 try:
     import urllib.request as urllib_request
     from urllib.request import urlopen
@@ -82,26 +87,26 @@ class JebenaCliException(Exception):
 
 
 class JebenaCliGQLException(JebenaCliException):
-    """GQL-specific error, raised when the server response indicates a bad GQL query."""
+    """GQL-specific error, raised when the server response indicates a bad query."""
 
 
 class JebenaCliMissingKeyException(JebenaCliException):
-    """Raised when client credentials are missing or the server indicates the user is invalid."""
+    """Raised when client credentials are missing or the user is invalid."""
 
 
 class JebenaCliGQLPermissionDenied(JebenaCliException):
-    """GQL-specific error, raised when the server response indicates the user does not have sufficient permission."""
+    """Raised when the user does not have sufficient server permissions for the query."""
 
 
 def run_query(
         query,
-        variables = None,
-        api_endpoint = None,
-        api_key_name = None,
-        api_secret_key = None,
-        allow_insecure_https = False,
-        return_instead_of_raise_on_errors = False,
-        skip_logging_transient_errors = False
+        variables=None,
+        api_endpoint=None,
+        api_key_name=None,
+        api_secret_key=None,
+        allow_insecure_https=False,
+        return_instead_of_raise_on_errors=False,
+        skip_logging_transient_errors=False
 ):
     # type: (str, dict, str, str, str, bool, bool, bool) -> dict
     """Send a GQL query to the Jebena API Server and return the server reply.
@@ -136,7 +141,6 @@ def run_query(
 
     :return: GQL response as a Python dict
     """
-
     # Avoid a condition where an empty query silently returns nothing:
     if not query:
         raise JebenaCliGQLException("Empty query.")
@@ -195,8 +199,8 @@ def run_query(
                 query = wrapped_query["query"]
             if "variables" in wrapped_query:
                 variables = wrapped_query["variables"]
-        except Exception:
-            # For Python 2 compatability: don't try to catch 'json.decoder.JSONDecodeError'
+        except Exception:  # noqa
+            # For Python 2 compatibility: don't try to catch 'json.decoder.JSONDecodeError'
             pass
 
     parsed_response = _execute_gql_query(
@@ -245,19 +249,23 @@ def run_query(
 def _execute_gql_query(
         api_endpoint,
         query,
-        variables = None,
-        allow_insecure_https = False,
-        api_key_name = None,
-        api_secret_key = None,
-        retries_allowed = 2,
-        skip_logging_transient_errors = False
+        variables=None,
+        allow_insecure_https=False,
+        api_key_name=None,
+        api_secret_key=None,
+        retries_allowed=2,
+        skip_logging_transient_errors=False
 ):
     # type: (str, str, dict, bool, str, str, int, bool) -> dict
     """Send a GQL query to the server and return the GQL response."""
     if not api_key_name:
-        raise JebenaCliMissingKeyException("Missing API Key Name (Try setting ENV variable JEBENA_API_KEY_NAME)")
+        raise JebenaCliMissingKeyException(
+            "Missing API Key Name (Try setting ENV variable JEBENA_API_KEY_NAME)"
+        )
     if not api_secret_key:
-        raise JebenaCliMissingKeyException("Missing API Secret Key (Try setting ENV variable JEBENA_API_SECRET_KEY)")
+        raise JebenaCliMissingKeyException(
+            "Missing API Secret Key (Try setting ENV variable JEBENA_API_SECRET_KEY)"
+        )
     if not variables:
         variables = []
     data = {
@@ -272,7 +280,8 @@ def _execute_gql_query(
     }
     is_query_a_mutation = False
     if query.split(None, 2)[0].lower() == 'mutation':
-        # In split() 'None' is separtor of whitespace and 2 is maxsplit; avoid kwargs for Python 2
+        # NB: avoid split()'s kwargs for Python 2 compatibility.
+        # In split() 'None' is separator of whitespace and 2 is maxsplit
         is_query_a_mutation = True
     try:
         request_payload = json.dumps(data).encode("utf-8")
@@ -292,8 +301,9 @@ def _execute_gql_query(
         headers=headers
     )
 
-    # Send and return response -- with a short retry / delay loop for non-mutation queries to give some
-    # support to network hiccups, server rate-limiting, or individual backend-node issues.
+    # Send and return response -- with a short retry / delay loop for non-mutation
+    # queries to give some support to network hiccups, server rate-limiting, or
+    # individual backend-node issues.
     if is_query_a_mutation:
         attempts_allowed = 1
     else:
@@ -304,7 +314,7 @@ def _execute_gql_query(
     retry_delay_factor = 3
 
     def _log_and_raise_or_retry(log_message, *args):
-        # type: (str) -> None
+        # type: (str, str) -> None
         """Log error and either return if retries allowed or raise."""
         if attempts_tried < attempts_allowed:
             if not skip_logging_transient_errors:
@@ -313,7 +323,7 @@ def _execute_gql_query(
         _log_and_raise(log_message, *args)
 
     def _log_and_raise(log_message, *args):
-        # type: (str) -> NoReturn
+        # type: (str, str) -> "NoReturn"  # noqa
         """Log error and raise now."""
         if not skip_logging_transient_errors:
             LOGGER.error(log_message, *args)
@@ -330,10 +340,10 @@ def _execute_gql_query(
             retry_delay_next_attempt_extra_delay = 0
             if not skip_logging_transient_errors:
                 LOGGER.warning(
-                    "Failed to fetch response from %s; retrying in %s seconds; %s attempts left.",
+                    "Failed to fetch from %s; retry in %s seconds; %s attempts left.",
                     api_endpoint,
                     retry_delay,
-                    (attempts_allowed - attempts_tried + 1)  # + 1 because we're after the += 1 above
+                    (attempts_allowed - attempts_tried + 1)  # We're after the += 1 above
                 )
             time.sleep(retry_delay)
 
@@ -341,8 +351,8 @@ def _execute_gql_query(
             context = None
             if allow_insecure_https:
                 context = ssl.SSLContext()
-            # Set an upper-bound to prevent process hangs on network issues, otherwise clients can
-            # hang indefinitely in certain network conditions:
+            # Set an upper-bound to prevent process hangs on network issues, otherwise
+            # clients can hang indefinitely in certain network conditions:
             connection_timeout_in_seconds = 300
             # NB: Mark urlopen() call with 'nosec' to acknowledge handling file:/ condition:
             LOGGER.debug("Calling urlopen(...)")
@@ -371,12 +381,13 @@ def _execute_gql_query(
             _log_and_raise_or_retry("Socket Timeout error")
             continue
 
-        except urllib.error.HTTPError as exc:
+        except urllib.error.HTTPError as exc:  # noqa
             if exc.code == 401:
                 # Regardless of retries left, always raise when using an unauthorized key:
-                time.sleep(1)  # Delay a little delay on 401; in case someone's calling us in a loop
+                time.sleep(1)  # Delay a little on 401; in case we are called inside a loop
                 _log_and_raise(
-                    "Invalid or disabled Jebena API Key (HTTP 401 Unauthorized) when using key %s on Jebena API Server %s",
+                    "Invalid or disabled Jebena API Key (HTTP 401 Unauthorized) "
+                    "when using key %s on Jebena API Server %s",
                     api_key_name,
                     api_endpoint,
                 )
@@ -405,10 +416,12 @@ def _execute_gql_query(
                 # more understandable in the context of our client:
                 response_data = json.loads(response)
                 LOGGER.critical(
-                    "Please file a bug report at https://github.com/jebena/jebena-python-client/issues for this:"
-                    "We should add handling for this error:\n%s", response
+                    "Please file a bug report at "
+                    "https://github.com/jebena/jebena-python-client/issues for this:\n"
+                    "We should add handling for this error:\n%s", response_data
                 )
-            except BaseException:
+            except BaseException:  # noqa
+                # NB: for Py 2.7 support, we need to catch something that exists in that version.
                 pass
             response_snippet = response[0:512]
             if len(response) > 512:
@@ -416,7 +429,8 @@ def _execute_gql_query(
 
             if exc.code in [502, 503]:
                 _log_and_raise_or_retry(
-                    "Jebena API Server %s returned an HTTP %s response\n *** Server Response:\n%s",
+                    "Jebena API Server %s returned an HTTP %s response\n"
+                    "*** Server Response:\n%s",
                     api_endpoint,
                     exc.code,
                     response_snippet
@@ -425,15 +439,17 @@ def _execute_gql_query(
 
             # For now, we're just printing out the first KB of the raw JSON response.
             _log_and_raise(
-                "Unknown Error; the Jebena API Server at %s has returned an unknown error (HTTP code: %s)\nResponse body:\n%s",
+                "Unknown Error; the Jebena API Server at %s has returned "
+                "an unknown error (HTTP code: %s)\nResponse body:\n%s",
                 api_endpoint,
                 exc.code,
                 response_snippet
             )
 
-        except urllib.error.URLError as exc:
+        except urllib.error.URLError as exc:  # noqa
             _log_and_raise_or_retry(
-                "URL Error (%s); check that network is accessible and that hostname is correct in Jebena API Server endpoint '%s'",
+                "URL Error (%s); check that the network is accessible and that "
+                "the hostname is correct in Jebena API Server endpoint '%s'",
                 str(exc),
                 api_endpoint
             )
@@ -455,7 +471,7 @@ def _execute_gql_query(
 
 def read_query_and_return_response():
     # type: () -> str
-    """Read a query from STDIN (prompting if necessary) and return the API server's response."""
+    """Read a query from STDIN (prompting if necessary) and return the server's response."""
     try:
         gql_query = read_from_stdin(
             user_prompt="Enter your GQL query, followed by return and "
@@ -473,7 +489,7 @@ def read_query_and_return_response():
     return json.dumps(gql_response, indent=2, sort_keys=True)
 
 
-def read_from_stdin(user_prompt = None):
+def read_from_stdin(user_prompt=None):
     # type: (str) -> str
     """Read from stdin until Ctrl-D, "." on empty line, or EOF occurs."""
     # If in a terminal, print some opening help:
@@ -506,24 +522,27 @@ def read_from_stdin(user_prompt = None):
 
 
 def __exit_client():
-    """Terminates python with non-zero exit code when we're run as a command-line too; for use with timeout watcher."""
+    """Terminates python with non-zero exit code when we're run as a command-line."""
     print("Client exceeded reasonable run time; terminating.", file=sys.stderr)
     os._exit(3)
 
 
 def main():
-    """Define a main function so that both __main__.py and this single python file can be directly used as a cli tool.
-    This allows users who want a single .py file to run stuff without needing to install this as a python module.
     """
-    # Our script uses both python's logger and print-to-stderr, defaulting to python's logger for import
-    # cases and flipping to a print-to-stderr mode when used as in a command line mode.
+    Read a single query from STDIN, execute it, and print the server response to STDOUT.
+
+    We place the main function here so that users can use this single .py file directly.
+    """
+    # Our script uses both python's logger and print-to-stderr. We default to
+    # python's logger for import cases and flip to a print-to-stderr mode when
+    # used as in a command line mode.
     logging_format = "Jebena GQL Client %(levelname)s: %(message)s"
     logging.basicConfig(format=logging_format)
     LOGGER.setLevel(logging.WARNING)
 
     # Run read_query_and_return_response() with a watcher thread to terminate too-slow runs.
     try:
-        # We limit cli runtimes to prevent hangs on failed network connection or very-bad GQL queries:
+        # We limit runtime to prevent hangs on failed network connection or bad GQL queries:
         maximum_run_time = 60 * 5
         watcher = Timer(maximum_run_time, __exit_client)
         watcher.start()
@@ -532,7 +551,10 @@ def main():
         print("", file=sys.stderr)
         sys.exit(99)
     except JebenaCliMissingKeyException:
-        print("Jebena API Keys missing; see https://github.com/jebena/jebena-python-client/blob/main/README.md")
+        print(
+            "Jebena API Keys missing; "
+            "see https://github.com/jebena/jebena-python-client/blob/main/README.md"
+        )
         sys.exit(99)
     except JebenaCliGQLException as exc:
         print("Jebena GQL Query Exception: %s" % exc, file=sys.stderr)
