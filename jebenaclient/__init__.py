@@ -1,5 +1,10 @@
+"""Jebena Client for the Jebena GraphQL API Server."""
 
-from .jebenaclient import (
+# We've intentionally designed the package namespace to be equal
+# to the single jebenaclient.py file, so that "quick and dirty" work
+# can snag the .py file directly and import it, with the same interface.
+
+from .jebenaclient import (  # noqa: F401
     __version__,
     JebenaCliException,
     JebenaCliGQLException,
