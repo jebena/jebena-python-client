@@ -57,7 +57,8 @@ Queries with variables are also supported by "wrapping" your query like so:
 # 0.7.1  20210128: Address socket timeout issue.
 # 0.8.0  20210204: Make script Python 2.7 compatible.
 # 0.8.1  20210217: Handle some flake8 / mypy issues in a Py 2.7 compatible way.
-__version__ = "0.8.1"
+# 0.8.2  20210302: Add support for GQL "operationName" parameter
+__version__ = "0.8.2"
 
 import http.client
 import json
