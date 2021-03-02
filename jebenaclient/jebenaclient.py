@@ -25,6 +25,9 @@ Variables can be passed in as well:
     from jebenaclient import run_query
     run_query(gql_query_string, variables=...)
 
+When running in Python, we recommend setting the operation_name for logging:
+   run_query(gql_query_string, operation_name="fetch_display_name")
+
 For GQL Schema help, see documentation on the Jebena API Server
 by visiting (using a web browser) the API endpoint you are using.
 
@@ -35,6 +38,13 @@ Queries with variables are also supported by "wrapping" your query like so:
 {
     "query": "query { me { person { displayName } } }",
     "variables": {"foo": "bar"}
+}
+
+Or, with an operation name:
+{
+    "query": "query operationName { me { person { displayName } } }",
+    "variables": {"foo": "bar"},
+    "operationName": "getDisplayName"
 }
 
 """
@@ -54,7 +64,8 @@ Queries with variables are also supported by "wrapping" your query like so:
 # 0.7.1  20210128: Address socket timeout issue.
 # 0.8.0  20210204: Make script Python 2.7 compatible.
 # 0.8.1  20210217: Handle some flake8 / mypy issues in a Py 2.7 compatible way.
-__version__ = "0.8.1"
+# 0.8.2  20210302: Add support for GQL "operationName" parameter
+__version__ = "0.8.2"
 
 import http.client
 import json
@@ -100,6 +111,7 @@ class JebenaCliGQLPermissionDenied(JebenaCliException):
 
 def run_query(
         query,
+        operation_name=None,
         variables=None,
         api_endpoint=None,
         api_key_name=None,
@@ -108,7 +120,7 @@ def run_query(
         return_instead_of_raise_on_errors=False,
         skip_logging_transient_errors=False
 ):
-    # type: (str, dict, str, str, str, bool, bool, bool) -> dict
+    # type: (str, str, dict, str, str, str, bool, bool, bool) -> dict
     """Send a GQL query to the Jebena API Server and return the server reply.
 
     OS Environ variables should be set for JEBENA_API_KEY_NAME, JEBENA_API_SECRET_KEY,
@@ -116,6 +128,8 @@ def run_query(
     those values can be passed to this function.
 
     :param query: GQL query string to run.
+
+    :param operation_name: (Optional) A name for the GQL operation; useful for logging / debugging.
 
     :param variables: Key-value dictionary of variables for query.
 
@@ -199,6 +213,8 @@ def run_query(
                 query = wrapped_query["query"]
             if "variables" in wrapped_query:
                 variables = wrapped_query["variables"]
+            if "operationName" in wrapped_query:
+                operation_name = wrapped_query["operationName"]
         except Exception:  # noqa
             # For Python 2 compatibility: don't try to catch 'json.decoder.JSONDecodeError'
             pass
@@ -206,6 +222,7 @@ def run_query(
     parsed_response = _execute_gql_query(
         api_endpoint,
         query,
+        operation_name=operation_name,
         variables=variables,
         allow_insecure_https=allow_insecure_https,
         api_key_name=api_key_name,
@@ -249,6 +266,7 @@ def run_query(
 def _execute_gql_query(
         api_endpoint,
         query,
+        operation_name=None,
         variables=None,
         allow_insecure_https=False,
         api_key_name=None,
@@ -256,7 +274,7 @@ def _execute_gql_query(
         retries_allowed=2,
         skip_logging_transient_errors=False
 ):
-    # type: (str, str, dict, bool, str, str, int, bool) -> dict
+    # type: (str, str, str, dict, bool, str, str, int, bool) -> dict
     """Send a GQL query to the server and return the GQL response."""
     if not api_key_name:
         raise JebenaCliMissingKeyException(
@@ -272,6 +290,8 @@ def _execute_gql_query(
         "query": query,
         "variables": variables,
     }
+    if operation_name:
+        data["operationName"] = operation_name
     headers = {
         "Accept": "application/json",
         "Authorization":  "ApiKey %s/%s" % (api_key_name, api_secret_key),
