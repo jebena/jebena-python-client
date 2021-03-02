@@ -40,6 +40,13 @@ Queries with variables are also supported by "wrapping" your query like so:
     "variables": {"foo": "bar"}
 }
 
+Or, with an operation name:
+{
+    "query": "query operationName { me { person { displayName } } }",
+    "variables": {"foo": "bar"},
+    "operationName": "getDisplayName"
+}
+
 """
 
 # Version history:
