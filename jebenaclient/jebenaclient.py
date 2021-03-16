@@ -66,7 +66,8 @@ Or, with an operation name:
 # 0.8.1  20210217: Handle some flake8 / mypy issues in a Py 2.7 compatible way.
 # 0.8.2  20210302: Add support for GQL "operationName" parameter
 # 0.8.3  20210316: Fix for http.lib import
-__version__ = "0.8.3"
+# 0.8.4  20210316: More fixes for Python 2.7
+__version__ = "0.8.4"
 
 import json
 import logging
@@ -84,14 +85,23 @@ try:
 except ImportError:
     from httplib import BadStatusLine as RemoteDisconnected  # Py 2
 try:
+    from json.decoder import JSONDecodeError as json_JSONDecodeError
+except ImportError:
+    # In Python 2, json.loads() raises this instead of JSONDecodeError:
+    json_JSONDecodeError = ValueError  # Py 2
+try:
     from urllib.parse import urlparse
 except ImportError:
     from urlparse import urlparse  # Py 2
 try:
     import urllib.request as urllib_request
+    from urllib.error import HTTPError as urllib_HTTPError
+    from urllib.error import URLError as urllib_URLError
     from urllib.request import urlopen
 except ImportError:
     import urllib2 as urllib_request  # Py 2
+    from urllib2 import HTTPError as urllib_HTTPError
+    from urllib2 import URLError as urllib_URLError
     from urllib2 import urlopen  # Py 2
 
 LOGGER = logging.getLogger("jebenaclient")
@@ -394,7 +404,7 @@ def _execute_gql_query(
                 )
             try:
                 return json.loads(response_string)
-            except json.decoder.JSONDecodeError:
+            except json_JSONDecodeError:
                 LOGGER.debug("Unable to decode response string:\n%s", response_string)
                 raise JebenaCliGQLException(
                     "Invalid GQL response from %s (unable to parse JSON: '%s...')" %
@@ -405,7 +415,7 @@ def _execute_gql_query(
             _log_and_raise_or_retry("Socket Timeout error")
             continue
 
-        except urllib.error.HTTPError as exc:  # noqa
+        except urllib_HTTPError as exc:  # qa
             if exc.code == 401:
                 # Regardless of retries left, always raise when using an unauthorized key:
                 time.sleep(1)  # Delay a little on 401; in case we are called inside a loop
@@ -470,7 +480,7 @@ def _execute_gql_query(
                 response_snippet
             )
 
-        except urllib.error.URLError as exc:  # noqa
+        except urllib_URLError as exc:  # noqa
             _log_and_raise_or_retry(
                 "URL Error (%s); check that the network is accessible and that "
                 "the hostname is correct in Jebena API Server endpoint '%s'",
@@ -548,7 +558,7 @@ def read_from_stdin(user_prompt=None):
 def __exit_client():
     """Terminates python with non-zero exit code when we're run as a command-line."""
     print("Client exceeded reasonable run time; terminating.", file=sys.stderr)
-    os._exit(3)
+    os._exit(3)  # noqa
 
 
 def main():
@@ -565,10 +575,10 @@ def main():
     LOGGER.setLevel(logging.WARNING)
 
     # Run read_query_and_return_response() with a watcher thread to terminate too-slow runs.
+    maximum_run_time = 60 * 5
+    watcher = Timer(maximum_run_time, __exit_client)
     try:
         # We limit runtime to prevent hangs on failed network connection or bad GQL queries:
-        maximum_run_time = 60 * 5
-        watcher = Timer(maximum_run_time, __exit_client)
         watcher.start()
         print(read_query_and_return_response())
     except KeyboardInterrupt:
