@@ -65,9 +65,8 @@ Or, with an operation name:
 # 0.8.0  20210204: Make script Python 2.7 compatible.
 # 0.8.1  20210217: Handle some flake8 / mypy issues in a Py 2.7 compatible way.
 # 0.8.2  20210302: Add support for GQL "operationName" parameter
-# 0.8.3  20210316: Fix for http.lib import
-# 0.8.4  20210316: More fixes for Python 2.7
-__version__ = "0.8.4"
+# 0.8.5  20210316: More fixes for Python 2.7
+__version__ = "0.8.5"
 
 import json
 import logging
@@ -384,7 +383,7 @@ def _execute_gql_query(
         try:
             context = None
             if allow_insecure_https:
-                context = ssl.SSLContext()
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS)  # Pass ssl.PROTOCOL_TLS for Py 2.7 compatibility
             # Set an upper-bound to prevent process hangs on network issues, otherwise
             # clients can hang indefinitely in certain network conditions:
             connection_timeout_in_seconds = 300
