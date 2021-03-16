@@ -65,9 +65,9 @@ Or, with an operation name:
 # 0.8.0  20210204: Make script Python 2.7 compatible.
 # 0.8.1  20210217: Handle some flake8 / mypy issues in a Py 2.7 compatible way.
 # 0.8.2  20210302: Add support for GQL "operationName" parameter
-__version__ = "0.8.2"
+# 0.8.3  20210316: Fix for http.lib import
+__version__ = "0.8.3"
 
-import http.client
 import json
 import logging
 import os
@@ -80,15 +80,19 @@ from threading import Timer
 
 # Python 2 compatibility:
 try:
+    from http.client import RemoteDisconnected
+except ImportError:
+    from httplib import BadStatusLine as RemoteDisconnected  # Py 2
+try:
     from urllib.parse import urlparse
 except ImportError:
-    from urlparse import urlparse
+    from urlparse import urlparse  # Py 2
 try:
     import urllib.request as urllib_request
     from urllib.request import urlopen
 except ImportError:
-    import urllib2 as urllib_request
-    from urllib2 import urlopen
+    import urllib2 as urllib_request  # Py 2
+    from urllib2 import urlopen  # Py 2
 
 LOGGER = logging.getLogger("jebenaclient")
 
@@ -475,7 +479,7 @@ def _execute_gql_query(
             )
             continue
 
-        except http.client.RemoteDisconnected as exc:
+        except RemoteDisconnected as exc:
             _log_and_raise_or_retry(
                 "Remote Disconnected Exception (%s)",
                 str(exc)
