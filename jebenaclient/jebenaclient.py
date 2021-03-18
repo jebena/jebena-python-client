@@ -66,7 +66,8 @@ Or, with an operation name:
 # 0.8.1  20210217: Handle some flake8 / mypy issues in a Py 2.7 compatible way.
 # 0.8.2  20210302: Add support for GQL "operationName" parameter
 # 0.8.5  20210316: More fixes for Python 2.7
-__version__ = "0.8.5"
+# 0.8.6  20210318: Expose retry logic for mutations for developers
+__version__ = "0.8.6"
 
 import json
 import logging
@@ -130,10 +131,11 @@ def run_query(
         api_key_name=None,
         api_secret_key=None,
         allow_insecure_https=False,
+        allow_retries_on_mutations=False,
         return_instead_of_raise_on_errors=False,
         skip_logging_transient_errors=False
 ):
-    # type: (str, str, dict, str, str, str, bool, bool, bool) -> dict
+    # type: (str, str, dict, str, str, str, bool, bool, bool, bool) -> dict
     """Send a GQL query to the Jebena API Server and return the server reply.
 
     OS Environ variables should be set for JEBENA_API_KEY_NAME, JEBENA_API_SECRET_KEY,
@@ -158,6 +160,10 @@ def run_query(
 
     :param allow_insecure_https: When true, allow self-signed SSL certificates.
     For localhost-based endpoints, this will automatically flip to True.
+
+    :param allow_retries_on_mutations: When true, any mutation-based query that
+    fails due to non-GQL errors will be retried. This should only be enabled for
+    idempotent mutations; there is no guarantee that the server did NOT process the request.
 
     :param return_instead_of_raise_on_errors: When true, return the GQL response
     and assume that the caller will inspect for errors, instead of raising.
@@ -240,6 +246,7 @@ def run_query(
         allow_insecure_https=allow_insecure_https,
         api_key_name=api_key_name,
         api_secret_key=api_secret_key,
+        allow_retries_on_mutations=allow_retries_on_mutations,
         skip_logging_transient_errors=skip_logging_transient_errors
     )
 
@@ -285,6 +292,7 @@ def _execute_gql_query(
         api_key_name=None,
         api_secret_key=None,
         retries_allowed=2,
+        allow_retries_on_mutations=False,
         skip_logging_transient_errors=False
 ):
     # type: (str, str, str, dict, bool, str, str, int, bool) -> dict
@@ -337,7 +345,7 @@ def _execute_gql_query(
     # Send and return response -- with a short retry / delay loop for non-mutation
     # queries to give some support to network hiccups, server rate-limiting, or
     # individual backend-node issues.
-    if is_query_a_mutation:
+    if is_query_a_mutation and not allow_retries_on_mutations:
         attempts_allowed = 1
     else:
         attempts_allowed = 1 + retries_allowed
