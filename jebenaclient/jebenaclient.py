@@ -67,7 +67,8 @@ Or, with an operation name:
 # 0.8.2  20210302: Add support for GQL "operationName" parameter
 # 0.8.5  20210316: More fixes for Python 2.7
 # 0.8.6  20210318: Expose retry logic for mutations for developers
-__version__ = "0.8.6"
+# 0.8.7  20210517: Fix for spurious warning in Python2 setups for logging
+__version__ = "0.8.7"
 
 import json
 import logging
@@ -105,7 +106,8 @@ except ImportError:
     from urllib2 import urlopen  # Py 2
 
 LOGGER = logging.getLogger("jebenaclient")
-
+if sys.version_info[0] == 2:
+    logging.basicConfig()
 
 class JebenaCliException(Exception):
     """Generic client error, indicating an issue with the connection or setup."""
