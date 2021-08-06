@@ -124,3 +124,12 @@ where loading secrets in the ENV is not practical.
    * `api_secret_key`: The secret key associated with your API key name.
     When not passed, ENV variable JEBENA_API_SECRET_KEY is read. This value must
     be kept securely stored!
+
+
+### Working with Jebena Trace IDs
+
+The Jebena API Server provides a "Jebena Trace ID" that can be used for tracing
+the backend server's logs for any given request. This is provided as an HTTP header to clients.
+
+Calling `jebenaclient.get_last_run_trace_id()` after any call to `jebenaclient.run_query()` will provide the Jebena Trace ID,
+which can then be used by server developers (e.g. `jebena aws logs trace <id>`)

@@ -47,6 +47,8 @@ Or, with an operation name:
     "operationName": "getDisplayName"
 }
 
+For developers, the Jebena Trace ID for the most recent call to run_query()
+is available by calling get_last_run_trace_id()
 """
 
 # Version history:
@@ -68,7 +70,8 @@ Or, with an operation name:
 # 0.8.5  20210316: More fixes for Python 2.7
 # 0.8.6  20210318: Expose retry logic for mutations for developers
 # 0.8.7  20210517: Fix for spurious warning in Python2 setups for logging
-__version__ = "0.8.7"
+# 0.8.8  20210806: Add get_last_run_trace_id() call
+__version__ = "0.8.8"
 
 import json
 import logging
@@ -108,6 +111,7 @@ except ImportError:
 LOGGER = logging.getLogger("jebenaclient")
 if sys.version_info[0] == 2:
     logging.basicConfig()
+
 
 class JebenaCliException(Exception):
     """Generic client error, indicating an issue with the connection or setup."""
@@ -285,6 +289,19 @@ def run_query(
     return parsed_response
 
 
+def get_last_run_trace_id():
+    """
+    Return the Jebena API Server's trace id for the last call to run_query().
+
+    This trace id can be used by developers to query the server's logging
+    system for details about what actions the backend performed.
+
+    :return: Most recent call to run_query()'s trace id
+    """
+    global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
+    return __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
+
+
 def _execute_gql_query(
         api_endpoint,
         query,
@@ -405,19 +422,33 @@ def _execute_gql_query(
                 timeout=connection_timeout_in_seconds
             )  # nosec
             LOGGER.debug("Finished urlopen(...)")
+            global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
+            __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None
+            try:
+                __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = response.info()["X-Log-Trace-ID"]
+                LOGGER.debug("Jebena Trace ID: %s", __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY)
+            except BaseException:
+                pass
             try:
                 response_string = response.read().decode("utf-8")
             except Exception as exc:
                 raise JebenaCliException(
-                    "Invalid response from %s (%s)" % (api_endpoint, exc)
+                    "Invalid response from %s (%s; Jebena Trace ID: %s)" % (
+                        api_endpoint,
+                        exc,
+                        __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
+                    )
                 )
             try:
                 return json.loads(response_string)
             except json_JSONDecodeError:
                 LOGGER.debug("Unable to decode response string:\n%s", response_string)
                 raise JebenaCliGQLException(
-                    "Invalid GQL response from %s (unable to parse JSON: '%s...')" %
-                    (api_endpoint, response_string[0:128])
+                    "Invalid GQL response from %s (unable to parse '%s...'; Jebena Trace ID: %s)" %
+                    (api_endpoint,
+                     response_string[0:128],
+                     __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
+                     ),
                 )
 
         except socket.timeout:
