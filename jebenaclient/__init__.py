@@ -11,8 +11,10 @@ from .jebenaclient import (  # noqa: F401
     JebenaCliGQLPermissionDenied,
     JebenaCliMissingKeyException,
     run_query,
+    get_last_run_trace_id,
 )
 
 __all__ = [
     'run_query',
+    'get_last_run_trace_id',
 ]

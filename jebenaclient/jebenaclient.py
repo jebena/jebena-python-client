@@ -108,9 +108,8 @@ except ImportError:
     from urllib2 import URLError as urllib_URLError
     from urllib2 import urlopen  # Py 2
 
-LOGGER = logging.getLogger("jebenaclient")
-if sys.version_info[0] == 2:
-    logging.basicConfig()
+__LOGGER = None  # See __get_logger()
+__JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None  # See get_last_run_trace_id()
 
 
 class JebenaCliException(Exception):
@@ -233,7 +232,7 @@ def run_query(
         # Wrapped:   {"query": query; "variables": {variables...}}
         try:
             wrapped_query = json.loads(query)
-            LOGGER.debug("Parsing wrapped query")
+            __get_logger().debug("Parsing wrapped query")
             if "query" in wrapped_query:
                 query = wrapped_query["query"]
             if "variables" in wrapped_query:
@@ -261,7 +260,7 @@ def run_query(
 
         if "errors" in parsed_response:
             exception_type = JebenaCliGQLException
-            LOGGER.error(
+            __get_logger().error(
                 "GQL response includes an error. Part of the query may have succeeded.\n"
                 " *** The original query was:\n%s\n\n"
                 " *** The full response was:\n%s\n\n",
@@ -275,12 +274,12 @@ def run_query(
                 error_messages.append(error["message"])
                 if "errorType" in error and error["errorType"] == "permissionDenied":
                     exception_type = JebenaCliGQLPermissionDenied
-                LOGGER.error(
+                __get_logger().error(
                     " *** GQL error #%s: %s\n",
                     error_count,
                     error["message"].rstrip()
                 )
-            LOGGER.error("For GraphQL schema, see Docs tab at %sdocs/graphiql", api_endpoint)
+            __get_logger().error("For GraphQL schema, see Docs tab at %sdocs/graphiql", api_endpoint)
             raise exception_type(
                 "GQL errors encountered (%s)" % '; '.join(error_messages)[0:512]
             )
@@ -353,8 +352,8 @@ def _execute_gql_query(
         raise JebenaCliException("Invalid API Endpoint %s" % api_endpoint)
     # By convention, our gql access point is under a sub-path of the API endpoint:
     gql_endpoint = "%sgql/" % api_endpoint
-    LOGGER.debug("Request URL: %s", gql_endpoint)
-    LOGGER.debug("Request body:\n%s\n", request_payload)
+    __get_logger().debug("Request URL: %s", gql_endpoint)
+    __get_logger().debug("Request body:\n%s\n", request_payload)
     req = urllib_request.Request(
         gql_endpoint,
         data=request_payload,
@@ -378,7 +377,7 @@ def _execute_gql_query(
         """Log error and either return if retries allowed or raise."""
         if attempts_tried < attempts_allowed:
             if not skip_logging_transient_errors:
-                LOGGER.warning(log_message, *args)
+                __get_logger().warning(log_message, *args)
             return
         _log_and_raise(log_message, *args)
 
@@ -386,12 +385,12 @@ def _execute_gql_query(
         # type: (str, str) -> "NoReturn"  # noqa
         """Log error and raise now."""
         if not skip_logging_transient_errors:
-            LOGGER.error(log_message, *args)
+            __get_logger().error(log_message, *args)
         raise JebenaCliException(log_message % args)
 
     while attempts_tried < attempts_allowed:
         attempts_tried += 1
-        LOGGER.debug("Sending query; attempt %s of %s", attempts_tried, attempts_allowed)
+        __get_logger().debug("Sending query; attempt %s of %s", attempts_tried, attempts_allowed)
         if attempts_tried > 1:
             # When re-attempting query, issue a warning and wait a bit before retrying:
             retry_delay = retry_delay_constant_delay + \
@@ -399,7 +398,7 @@ def _execute_gql_query(
                           retry_delay_factor ** attempts_tried
             retry_delay_next_attempt_extra_delay = 0
             if not skip_logging_transient_errors:
-                LOGGER.warning(
+                __get_logger().warning(
                     "Failed to fetch from %s; retry in %s seconds; %s attempts left.",
                     api_endpoint,
                     retry_delay,
@@ -415,18 +414,18 @@ def _execute_gql_query(
             # clients can hang indefinitely in certain network conditions:
             connection_timeout_in_seconds = 300
             # NB: Mark urlopen() call with 'nosec' to acknowledge handling file:/ condition:
-            LOGGER.debug("Calling urlopen(...)")
+            __get_logger().debug("Calling urlopen(...)")
             response = urlopen(
                 req,
                 context=context,
                 timeout=connection_timeout_in_seconds
             )  # nosec
-            LOGGER.debug("Finished urlopen(...)")
+            __get_logger().debug("Finished urlopen(...)")
             global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
             __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None
             try:
                 __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = response.info()["X-Log-Trace-ID"]
-                LOGGER.debug("Jebena Trace ID: %s", __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY)
+                __get_logger().debug("Jebena Trace ID: %s", __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY)
             except BaseException:
                 pass
             try:
@@ -442,7 +441,7 @@ def _execute_gql_query(
             try:
                 return json.loads(response_string)
             except json_JSONDecodeError:
-                LOGGER.debug("Unable to decode response string:\n%s", response_string)
+                __get_logger().debug("Unable to decode response string:\n%s", response_string)
                 raise JebenaCliGQLException(
                     "Invalid GQL response from %s (unable to parse '%s...'; Jebena Trace ID: %s)" %
                     (api_endpoint,
@@ -489,7 +488,7 @@ def _execute_gql_query(
                 # Try parsing the response to see if we have an error that we can wrap and make
                 # more understandable in the context of our client:
                 response_data = json.loads(response)
-                LOGGER.critical(
+                __get_logger().critical(
                     "Please file a bug report at "
                     "https://github.com/jebena/jebena-python-client/issues for this:\n"
                     "We should add handling for this error:\n%s", response_data
@@ -595,6 +594,24 @@ def read_from_stdin(user_prompt=None):
     return "".join(reads)
 
 
+def __get_logger():
+    """Return a python logger for emitting logs."""
+    global __LOGGER
+    if not __LOGGER:
+        __LOGGER = logging.getLogger("jebenaclient")
+        if sys.version_info[0] == 2:
+            # We define this "__get_logger" function in order to avoid triggering LOGGER stuff
+            # at import of jebenaclient. This allows us to run in py2 environments that have
+            # their own logging config to setup and run before we call this.
+            # However, if the py2 env does not set up loggers, we need to do so here.
+            # The cleanest way to do this is to fetch the root logger, and if it has no handlers,
+            # then call basicConfig
+            if not len(logging.getLogger().handlers):
+                logging.basicConfig()
+                __LOGGER.setLevel(logging.WARNING)
+    return __LOGGER
+
+
 def __exit_client():
     """Terminates python with non-zero exit code when we're run as a command-line."""
     print("Client exceeded reasonable run time; terminating.", file=sys.stderr)
@@ -607,13 +624,6 @@ def main():
 
     We place the main function here so that users can use this single .py file directly.
     """
-    # Our script uses both python's logger and print-to-stderr. We default to
-    # python's logger for import cases and flip to a print-to-stderr mode when
-    # used as in a command line mode.
-    logging_format = "Jebena GQL Client %(levelname)s: %(message)s"
-    logging.basicConfig(format=logging_format)
-    LOGGER.setLevel(logging.WARNING)
-
     # Run read_query_and_return_response() with a watcher thread to terminate too-slow runs.
     maximum_run_time = 60 * 5
     watcher = Timer(maximum_run_time, __exit_client)
