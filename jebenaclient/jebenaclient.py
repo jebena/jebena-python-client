@@ -70,8 +70,9 @@ is available by calling get_last_run_trace_id()
 # 0.8.5  20210316: More fixes for Python 2.7
 # 0.8.6  20210318: Expose retry logic for mutations for developers
 # 0.8.7  20210517: Fix for spurious warning in Python2 setups for logging
-# 0.8.8  20210806: Add get_last_run_trace_id() call
-__version__ = "0.8.8"
+# 0.9.0  20210806: Add get_last_run_trace_id() call;
+#                  re-work python logging setup for py2 issue
+__version__ = "0.9.0"
 
 import json
 import logging
@@ -180,7 +181,7 @@ def run_query(
     :return: GQL response as a Python dict
     """
     # Avoid a condition where an empty query silently returns nothing:
-    if not query:
+    if not query or not query.strip():
         raise JebenaCliGQLException("Empty query.")
 
     # When API parameters aren't passed in, fall back on loading from environment:
@@ -599,16 +600,17 @@ def __get_logger():
     global __LOGGER
     if not __LOGGER:
         __LOGGER = logging.getLogger("jebenaclient")
+        # We define this "__get_logger" function in order to avoid triggering LOGGER stuff
+        # at import of jebenaclient. This allows us to run in py2 environments that have
+        # their own logging config to setup, which could run after this module is loaded.
+        # However, if the py2 env does not set up loggers, we need to do so before calling
+        # the logger to avoid spurious errors about unconfigured loggers.
+        # The cleanest way to do this is to 1) check if we're in Python 2; and if so,
+        # 2) fetch the root logger, and 3) if it has no handlers, call basicConfig
         if sys.version_info[0] == 2:
-            # We define this "__get_logger" function in order to avoid triggering LOGGER stuff
-            # at import of jebenaclient. This allows us to run in py2 environments that have
-            # their own logging config to setup and run before we call this.
-            # However, if the py2 env does not set up loggers, we need to do so here.
-            # The cleanest way to do this is to fetch the root logger, and if it has no handlers,
-            # then call basicConfig
             if not len(logging.getLogger().handlers):
                 logging.basicConfig()
-                __LOGGER.setLevel(logging.WARNING)
+                __LOGGER.setLevel(logging.ERROR)
     return __LOGGER
 
 
