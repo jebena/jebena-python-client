@@ -72,7 +72,8 @@ is available by calling get_last_run_trace_id()
 # 0.8.7  20210517: Fix for spurious warning in Python2 setups for logging
 # 0.9.0  20210806: Add get_last_run_trace_id() call;
 #                  re-work python logging setup for py2 issue
-__version__ = "0.9.0"
+# 0.9.1  20210813: Re-work logger to add NullHandler for py2 reasons
+__version__ = "0.9.1"
 
 import json
 import logging
@@ -599,18 +600,12 @@ def __get_logger():
     """Return a python logger for emitting logs."""
     global __LOGGER
     if not __LOGGER:
-        __LOGGER = logging.getLogger("jebenaclient")
-        # We define this "__get_logger" function in order to avoid triggering LOGGER stuff
-        # at import of jebenaclient. This allows us to run in py2 environments that have
-        # their own logging config to setup, which could run after this module is loaded.
-        # However, if the py2 env does not set up loggers, we need to do so before calling
-        # the logger to avoid spurious errors about unconfigured loggers.
-        # The cleanest way to do this is to 1) check if we're in Python 2; and if so,
-        # 2) fetch the root logger, and 3) if it has no handlers, call basicConfig
+        __LOGGER = logging.getLogger(__name__)
+        # We add a NullHandler() to avoid spurious "No handler found" errors in Python 2.
+        # We lazy-load the logger here in order to give any other code importing us time to set up
+        # logging config. (NB: this lazy-load is possibly unneeded, now that we've found the NullHandler approach.)
         if sys.version_info[0] == 2:
-            if not len(logging.getLogger().handlers):
-                logging.basicConfig()
-                __LOGGER.setLevel(logging.ERROR)
+            __LOGGER.addHandler(logging.NullHandler())
     return __LOGGER
 
 
