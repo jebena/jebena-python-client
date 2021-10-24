@@ -634,7 +634,8 @@ def main():
     except JebenaCliMissingKeyException:
         print(
             "Jebena API Keys missing; "
-            "see https://github.com/jebena/jebena-python-client/blob/main/README.md"
+            "see https://github.com/jebena/jebena-python-client/blob/main/README.md",
+            file=sys.stderr
         )
         sys.exit(99)
     except JebenaCliGQLException as exc:
