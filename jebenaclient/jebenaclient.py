@@ -73,7 +73,8 @@ is available by calling get_last_run_trace_id()
 # 0.9.0  20210806: Add get_last_run_trace_id() call;
 #                  re-work python logging setup for py2 issue
 # 0.9.1  20210813: Re-work logger to add NullHandler for py2 reasons
-__version__ = "0.9.1"
+# 0.9.2  20230222: Improve timeout handling error messages, for clarity
+__version__ = "0.9.2"
 
 import json
 import logging
@@ -112,6 +113,9 @@ except ImportError:
 
 __LOGGER = None  # See __get_logger()
 __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None  # See get_last_run_trace_id()
+__MAX_RUN_TIME_IN_SECONDS = 60 * 5
+if os.getenv('JEBENA_CLIENT_TIMEOUT'):
+    __MAX_RUN_TIME_IN_SECONDS = int(os.getenv('JEBENA_CLIENT_TIMEOUT'))
 
 
 class JebenaCliException(Exception):
@@ -401,7 +405,7 @@ def _execute_gql_query(
             retry_delay_next_attempt_extra_delay = 0
             if not skip_logging_transient_errors:
                 __get_logger().warning(
-                    "Failed to fetch from %s; retry in %s seconds; %s attempts left.",
+                    "Jebena client failed to fetch from %s; retry in %s seconds; %s attempts left.",
                     api_endpoint,
                     retry_delay,
                     (attempts_allowed - attempts_tried + 1)  # We're after the += 1 above
@@ -412,15 +416,14 @@ def _execute_gql_query(
             context = None
             if allow_insecure_https:
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS)  # Pass ssl.PROTOCOL_TLS for Py 2.7 compatibility
-            # Set an upper-bound to prevent process hangs on network issues, otherwise
+            # NB: Set an upper-bound run time with timeout to prevent process hangs on network issues, otherwise
             # clients can hang indefinitely in certain network conditions:
-            connection_timeout_in_seconds = 300
             # NB: Mark urlopen() call with 'nosec' to acknowledge handling file:/ condition:
             __get_logger().debug("Calling urlopen(...)")
             response = urlopen(
                 req,
                 context=context,
-                timeout=connection_timeout_in_seconds
+                timeout=__MAX_RUN_TIME_IN_SECONDS
             )  # nosec
             __get_logger().debug("Finished urlopen(...)")
             global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
@@ -611,7 +614,15 @@ def __get_logger():
 
 def __exit_client():
     """Terminates python with non-zero exit code when we're run as a command-line."""
-    print("Client exceeded reasonable run time; terminating.", file=sys.stderr)
+    print(
+        "Error: Request terminated. Jebena client exceeded max run time (%s seconds). "
+        "This typically means the API server was unable to generate a response within a reasonable time. "
+        "Check that the GQL query isn't over-fetching. It's also possible that more involved API calls may "
+        "take longer than expected, in which case try temporarily increasing the timeout by setting the"
+        "ENV variable 'JEBENA_CLIENT_TIMEOUT' in your shell: export JEBENA_CLIENT_TIMEOUT=%s"
+        % (__MAX_RUN_TIME_IN_SECONDS, __MAX_RUN_TIME_IN_SECONDS * 2),
+        file=sys.stderr
+    )
     os._exit(3)  # noqa
 
 
@@ -622,8 +633,7 @@ def main():
     We place the main function here so that users can use this single .py file directly.
     """
     # Run read_query_and_return_response() with a watcher thread to terminate too-slow runs.
-    maximum_run_time = 60 * 5
-    watcher = Timer(maximum_run_time, __exit_client)
+    watcher = Timer(__MAX_RUN_TIME_IN_SECONDS, __exit_client)
     try:
         # We limit runtime to prevent hangs on failed network connection or bad GQL queries:
         watcher.start()
