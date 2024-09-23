@@ -74,7 +74,8 @@ is available by calling get_last_run_trace_id()
 #                  re-work python logging setup for py2 issue
 # 0.9.1  20210813: Re-work logger to add NullHandler for py2 reasons
 # 0.9.2  20230222: Improve timeout handling error messages, for clarity
-__version__ = "0.9.2"
+# 0.9.3  20240923: Add timeout and hint on socket error, for more clarity on timeout cases
+__version__ = "0.9.3"
 
 import json
 import logging
@@ -412,6 +413,7 @@ def _execute_gql_query(
                 )
             time.sleep(retry_delay)
 
+        start_time = time.time()
         try:
             context = None
             if allow_insecure_https:
@@ -456,7 +458,12 @@ def _execute_gql_query(
                 )
 
         except socket.timeout:
-            _log_and_raise_or_retry("Socket Timeout error")
+            run_time = time.time() - start_time
+            _log_and_raise_or_retry(
+                "Socket Timeout error (%s seconds; max allowed is %s; hint: set ENV JEBENA_CLIENT_TIMEOUT)",
+                run_time,
+                __MAX_RUN_TIME_IN_SECONDS
+            )
             continue
 
         except urllib_HTTPError as exc:  # qa
