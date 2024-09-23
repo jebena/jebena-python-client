@@ -458,9 +458,9 @@ def _execute_gql_query(
                 )
 
         except socket.timeout:
-            run_time = time.time() - start_time
+            run_time = int(time.time() - start_time)
             _log_and_raise_or_retry(
-                "Socket Timeout error (%s seconds; max allowed is %s; hint: set ENV JEBENA_CLIENT_TIMEOUT)",
+                "Socket Timeout error after %s seconds; max allowed is %s. (Hint: set ENV JEBENA_CLIENT_TIMEOUT)",
                 run_time,
                 __MAX_RUN_TIME_IN_SECONDS
             )
