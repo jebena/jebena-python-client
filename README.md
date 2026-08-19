@@ -3,6 +3,8 @@
 
 This package implements a simple python client for accessing the Jebena server. 
 Our client handles basic retry logic and error handling, and supports usage via both command-line and importing in python code.
+
+Requires Python 3.8 or newer, and nothing outside the standard library.
   
 
 ## Usage
@@ -44,8 +46,8 @@ Our client handles basic retry logic and error handling, and supports usage via 
    
         * Command line method: for pip, run `python3 -m jebenaclient`; for .py file, run `./jebenaclient.py` and then enter your query at the prompt.
             * If your query is in a file, you can pipe your query in:
-               * `cat some-query.txt | python -m jebenaclient`
-               * `echo "query { me { person { displayName } } }" | python -m jebenaclient`
+               * `cat some-query.txt | python3 -m jebenaclient`
+               * `echo "query { me { person { displayName } } }" | python3 -m jebenaclient`
     
         * Python code method: import the client and call `jebenaclient.run_query` (see below for additional details).
              ```
