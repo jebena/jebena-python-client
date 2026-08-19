@@ -77,6 +77,7 @@ is available by calling get_last_run_trace_id()
 # 0.9.3  20240923: Add timeout and hint on socket error, for more clarity on timeout cases
 __version__ = "0.9.3"
 
+import errno
 import json
 import logging
 import os
@@ -308,6 +309,39 @@ def get_last_run_trace_id():
     return __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
 
 
+def _is_query_a_mutation(query):
+    # type: (str) -> bool
+    """Return True when the given GQL query is a mutation.
+
+    Mutations are not retried by default, so err on the side of calling
+    something a mutation: 'mutation{...}' with no separating whitespace
+    must be caught just as surely as 'mutation { ... }'.
+    """
+    stripped_query = query.lstrip()
+    if not stripped_query.lower().startswith("mutation"):
+        return False
+    remainder = stripped_query[len("mutation"):]
+    # A bare "mutation" is the whole query; otherwise the next character has to be a
+    # separator (whitespace, '{', or the '(' of a variable list) rather than part of a
+    # longer word, so that a query named e.g. "query mutationsById {...}" isn't matched.
+    return not remainder or not (remainder[0].isalnum() or remainder[0] == "_")
+
+
+def _is_connection_refused(exc):
+    # type: (Exception) -> bool
+    """Return True when a URLError was caused by the connection being refused.
+
+    ECONNREFUSED means the peer answered our TCP SYN with a RST: no socket was
+    ever opened and no bytes were ever sent, so the request provably did not run.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, socket.gaierror):
+        # DNS failures carry EAI_* codes in .errno, which share a number space
+        # with the errno codes we're testing for here. Never confuse the two.
+        return False
+    return getattr(reason, "errno", None) == errno.ECONNREFUSED
+
+
 def _execute_gql_query(
         api_endpoint,
         query,
@@ -344,11 +378,7 @@ def _execute_gql_query(
         "Content-Type": "application/json",
         "User-Agent": "jebena-cli-tool/%s" % __version__,
     }
-    is_query_a_mutation = False
-    if query.split(None, 2)[0].lower() == 'mutation':
-        # NB: avoid split()'s kwargs for Python 2 compatibility.
-        # In split() 'None' is separator of whitespace and 2 is maxsplit
-        is_query_a_mutation = True
+    is_query_a_mutation = _is_query_a_mutation(query)
     try:
         request_payload = json.dumps(data).encode("utf-8")
     except TypeError as exc:
@@ -374,6 +404,7 @@ def _execute_gql_query(
         attempts_allowed = 1
     else:
         attempts_allowed = 1 + retries_allowed
+    # NB: attempts_allowed may be raised mid-loop; see the URLError handler below.
     attempts_tried = 0
     retry_delay_constant_delay = 5
     retry_delay_next_attempt_extra_delay = 0
@@ -532,6 +563,14 @@ def _execute_gql_query(
             )
 
         except urllib_URLError as exc:  # noqa
+            if attempts_allowed == 1 and _is_connection_refused(exc):
+                # "Connection refused" means the TCP connection was never established,
+                # so the server provably never saw this request. That makes a re-send
+                # safe even for a mutation: there is nothing on the server to duplicate.
+                # (Every other failure mode here is ambiguous -- a timeout or a dropped
+                # connection may well have left a mutation applied server-side -- which
+                # is why mutations otherwise get a single attempt.)
+                attempts_allowed = 1 + retries_allowed
             _log_and_raise_or_retry(
                 "URL Error (%s); check that the network is accessible and that "
                 "the hostname is correct in Jebena API Server endpoint '%s'",
