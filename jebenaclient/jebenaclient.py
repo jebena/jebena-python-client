@@ -73,7 +73,8 @@ is available by calling get_last_run_trace_id()
 # 0.9.2  20230222: Improve timeout handling error messages, for clarity
 # 0.9.3  20240923: Add timeout and hint on socket error, for more clarity on timeout cases
 # 0.10.0 20260818: Drop Python 2.7 support (Python 3.8+ only); retry mutations on
-#                  a refused connection; move packaging to pyproject.toml.
+#                  a refused connection; move packaging to pyproject.toml;
+#                  send GQL "variables" as a map; quieter HTTP error logging.
 __version__ = "0.10.0"
 
 import errno
@@ -85,7 +86,7 @@ import socket
 import ssl
 import sys
 import time
-from http.client import RemoteDisconnected
+from http.client import HTTPException, RemoteDisconnected
 from json import JSONDecodeError
 from threading import Timer
 from typing import NoReturn, Optional
@@ -339,8 +340,10 @@ def _execute_gql_query(
         raise JebenaCliMissingKeyException(
             "Missing API Secret Key (Try setting ENV variable JEBENA_API_SECRET_KEY)"
         )
-    if not variables:
-        variables = []
+    if variables is None:
+        # NB: GQL defines "variables" as a map; an empty list here is invalid per spec
+        # and only ever worked because the server tolerated it.
+        variables = {}
     data = {
         "query": query,
         "variables": variables,
@@ -436,12 +439,10 @@ def _execute_gql_query(
             )  # nosec
             LOGGER.debug("Finished urlopen(...)")
             global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
-            __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None
-            try:
-                __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = response.info()["X-Log-Trace-ID"]
-                LOGGER.debug("Jebena Trace ID: %s", __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY)
-            except BaseException:
-                pass
+            # HTTPMessage.__getitem__ returns None for a header the server didn't send,
+            # so no guard is needed here:
+            __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = response.info()["X-Log-Trace-ID"]
+            LOGGER.debug("Jebena Trace ID: %s", __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY)
             try:
                 response_string = response.read().decode("utf-8")
             except Exception as exc:
@@ -492,31 +493,24 @@ def _execute_gql_query(
                 retry_delay_next_attempt_extra_delay = 10
                 continue
 
-            # Response document may be a Jebena API Server response with info:
-            response = "(Non-UTF-8 response)"
+            # The response document may be a Jebena API Server error document, like so:
+            #    {
+            #      "details": {"errorType":"http",
+            #                  "message":"Api-key not found.",
+            #                  "status":401},
+            #      "message":"Api-key not found.",
+            #      "status":401
+            #    }
+            # The server's own message is already in there, so we surface the body
+            # verbatim below rather than re-formatting it.
+            response_body = "(Non-UTF-8 response)"
             try:
-                response = exc.read().decode("utf-8", "replace")
-                # response can potentially be a JSON doc from Jebena API server, like so:
-                #    {
-                #      "details": {"errorType":"http",
-                #                  "message":"Api-key not found.",
-                #                  "status":401},
-                #      "message":"Api-key not found.",
-                #      "status":401
-                #    }
-                # Try parsing the response to see if we have an error that we can wrap and make
-                # more understandable in the context of our client:
-                response_data = json.loads(response)
-                LOGGER.critical(
-                    "Please file a bug report at "
-                    "https://github.com/jebena/jebena-python-client/issues for this:\n"
-                    "We should add handling for this error:\n%s", response_data
-                )
-            except BaseException:  # noqa
-                # NB: for Py 2.7 support, we need to catch something that exists in that version.
+                response_body = exc.read().decode("utf-8", "replace")
+            except (OSError, HTTPException):
+                # Body could not be read off the socket; the status code will have to do.
                 pass
-            response_snippet = response[0:512]
-            if len(response) > 512:
+            response_snippet = response_body[0:512]
+            if len(response_body) > 512:
                 response_snippet += "..."
 
             if exc.code in [502, 503]:
@@ -532,7 +526,9 @@ def _execute_gql_query(
             # For now, we're just printing out the first KB of the raw JSON response.
             _log_and_raise(
                 "Unknown Error; the Jebena API Server at %s has returned "
-                "an unknown error (HTTP code: %s)\nResponse body:\n%s",
+                "an unknown error (HTTP code: %s)\nResponse body:\n%s\n"
+                "If this client should handle this error more gracefully, please file a bug at "
+                "https://github.com/jebena/jebena-python-client/issues",
                 api_endpoint,
                 exc.code,
                 response_snippet
