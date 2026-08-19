@@ -2,7 +2,7 @@ from distutils.core import setup
 setup(
   name = 'jebena-python-client',
   packages = ['jebenaclient'],
-  version = '0.9.1',
+  version = '0.9.3',
   license='mpl-2.0',
   description = 'Simple Python Client for the Jebena API Server',
   author = 'Jeff Potter',

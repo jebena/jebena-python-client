@@ -1,7 +1,7 @@
 ![Buna the Corgi](./documentation/buna-the-corgi.svg)
 # Jebena Client for Python
 
-This packages implements a simple python client for accessing the Jebena server. 
+This package implements a simple python client for accessing the Jebena server. 
 Our client handles basic retry logic and error handling, and supports usage via both command-line and importing in python code.
   
 
@@ -20,7 +20,7 @@ Our client handles basic retry logic and error handling, and supports usage via 
        * On MacOS: create an encrypted disk image using Disk Utility (File -> New Image -> Blank Image; set Encryption to 256-bit). 
          Inside it create a file name `./jebena-keys.sh`.
          Edit the file to have your API values like below. 
-         You can then `src /Volumes/<disk-name>/jebena-keys.sh` to load your API keys into a shell when you need. 
+         You can then `source /Volumes/<disk-name>/jebena-keys.sh` to load your API keys into a shell when you need. 
          (If you reboot, re-open the .img file to re-mount the encrypted disk image.)
           ```
           export JEBENA_API_KEY_NAME=jeb00000...
@@ -80,7 +80,7 @@ print(response["data"]["project"])
 
 **Wrapped Query Method.** Your GQL query can include both `query` and `variable` keys, for a "wrapped" query.
 
-For example, in the shell (the "heredoc" can be replace with a file, e.g. `cat query.txt | ./jebenaclient.py`):
+For example, in the shell (the "heredoc" can be replaced with a file, e.g. `cat query.txt | ./jebenaclient.py`):
 ```
 source /path/to/jebena-keys.sh
 cat <<'EOF' | ./jebenaclient.py

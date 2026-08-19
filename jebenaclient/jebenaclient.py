@@ -4,7 +4,7 @@
 from __future__ import print_function
 
 """
-A very simply GQL Client for the Jebena API Server.
+A very simple GQL Client for the Jebena API Server.
 
 Key features:
   * Support for usage via both command-line and python import
@@ -31,7 +31,7 @@ When running in Python, we recommend setting the operation_name for logging:
 For GQL Schema help, see documentation on the Jebena API Server
 by visiting (using a web browser) the API endpoint you are using.
 
-Example of a simply GQL query:
+Example of a simple GQL query:
     query { me { person { displayName } } }
 
 Queries with variables are also supported by "wrapping" your query like so:
@@ -320,7 +320,7 @@ def _execute_gql_query(
         allow_retries_on_mutations=False,
         skip_logging_transient_errors=False
 ):
-    # type: (str, str, str, dict, bool, str, str, int, bool) -> dict
+    # type: (str, str, str, dict, bool, str, str, int, bool, bool) -> dict
     """Send a GQL query to the server and return the GQL response."""
     if not api_key_name:
         raise JebenaCliMissingKeyException(
@@ -466,7 +466,7 @@ def _execute_gql_query(
             )
             continue
 
-        except urllib_HTTPError as exc:  # qa
+        except urllib_HTTPError as exc:  # noqa
             if exc.code == 401:
                 # Regardless of retries left, always raise when using an unauthorized key:
                 time.sleep(1)  # Delay a little on 401; in case we are called inside a loop
@@ -550,7 +550,7 @@ def _execute_gql_query(
     # We shouldn't actually ever hit this condition, based on our above try/catch code,
     # but any programming error above could lead to falling off of the edge:
     raise JebenaCliException(
-        "Unknown client issue when connection to Jebena API Server at %s" % api_endpoint
+        "Unknown client issue when connecting to Jebena API Server at %s" % api_endpoint
     )
 
 
@@ -625,7 +625,7 @@ def __exit_client():
         "Error: Request terminated. Jebena client exceeded max run time (%s seconds). "
         "This typically means the API server was unable to generate a response within a reasonable time. "
         "Check that the GQL query isn't over-fetching. It's also possible that more involved API calls may "
-        "take longer than expected, in which case try temporarily increasing the timeout by setting the"
+        "take longer than expected, in which case try temporarily increasing the timeout by setting the "
         "ENV variable 'JEBENA_CLIENT_TIMEOUT' in your shell: export JEBENA_CLIENT_TIMEOUT=%s"
         % (__MAX_RUN_TIME_IN_SECONDS, __MAX_RUN_TIME_IN_SECONDS * 2),
         file=sys.stderr
