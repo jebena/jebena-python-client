@@ -75,7 +75,9 @@ is available by calling get_last_run_trace_id()
 # 0.10.0 20260818: Drop Python 2.7 support (Python 3.8+ only); retry mutations on
 #                  a refused connection; move packaging to pyproject.toml;
 #                  send GQL "variables" as a map; quieter HTTP error logging.
-__version__ = "0.10.0"
+# 0.10.1 20260820: Decide mutation retries per failure rather than widening the
+#                  budget; skip GQL ignored tokens when classifying a document.
+__version__ = "0.10.1"
 
 import errno
 import json
@@ -288,20 +290,49 @@ def get_last_run_trace_id() -> Optional[str]:
     return __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
 
 
-def _is_query_a_mutation(query: str) -> bool:
-    """Return True when the given GQL query is a mutation.
+# Characters GraphQL treats as "ignored tokens" and permits before the first real
+# token of a document: whitespace, commas, and a leading unicode BOM. NB: str.lstrip()
+# alone will not remove the BOM, since \ufeff is not whitespace to Python.
+__GQL_IGNORED_CHARACTERS = " \t\r\n\f\v,\ufeff"
 
-    Mutations are not retried by default, so err on the side of calling
-    something a mutation: 'mutation{...}' with no separating whitespace
-    must be caught just as surely as 'mutation { ... }'.
+
+def _strip_leading_gql_ignored_tokens(query: str) -> str:
+    """Return the query with any leading GQL ignored tokens and comments removed."""
+    remainder = query
+    while True:
+        remainder = remainder.lstrip(__GQL_IGNORED_CHARACTERS)
+        if not remainder.startswith("#"):
+            return remainder
+        # GQL comments run to the end of the line and may precede the first real token:
+        end_of_line = remainder.find("\n")
+        if end_of_line == -1:
+            return ""
+        remainder = remainder[end_of_line + 1:]
+
+
+def _is_query_retry_safe(query: str) -> bool:
+    """Return True only when a document is confidently incapable of writing.
+
+    Re-sending is safe only for documents that cannot mutate data, so this
+    deliberately fails closed: anything not positively recognized as a query --
+    including anything we cannot confidently scan -- is treated as a mutation and
+    gets a single attempt. Being wrong in that direction costs a retry on a read;
+    being wrong in the other direction risks a duplicate write.
+
+    NB: a document whose first definition is a fragment is therefore treated as
+    unsafe, even when the operation it precedes is a query.
     """
-    stripped_query = query.lstrip()
-    if not stripped_query.lower().startswith("mutation"):
+    document = _strip_leading_gql_ignored_tokens(query)
+    if document.startswith("{"):
+        # Anonymous shorthand query, e.g. "{ me { person { displayName } } }". A
+        # wrapped-query JSON object also starts with "{", and may well wrap a
+        # mutation, so require an inner token that could begin a selection set:
+        inner = _strip_leading_gql_ignored_tokens(document[1:])
+        return bool(inner) and not inner.startswith(('"', "'"))
+    if not document.lower().startswith("query"):
         return False
-    remainder = stripped_query[len("mutation"):]
-    # A bare "mutation" is the whole query; otherwise the next character has to be a
-    # separator (whitespace, '{', or the '(' of a variable list) rather than part of a
-    # longer word, so that a query named e.g. "query mutationsById {...}" isn't matched.
+    remainder = document[len("query"):]
+    # Require a separator, so that "queryFoo { ... }" is not read as a query:
     return not remainder or not (remainder[0].isalnum() or remainder[0] == "_")
 
 
@@ -356,7 +387,6 @@ def _execute_gql_query(
         "Content-Type": "application/json",
         "User-Agent": "jebena-cli-tool/%s" % __version__,
     }
-    is_query_a_mutation = _is_query_a_mutation(query)
     try:
         request_payload = json.dumps(data).encode("utf-8")
     except TypeError as exc:
@@ -375,21 +405,37 @@ def _execute_gql_query(
         headers=headers
     )
 
-    # Send and return response -- with a short retry / delay loop for non-mutation
-    # queries to give some support to network hiccups, server rate-limiting, or
-    # individual backend-node issues.
-    if is_query_a_mutation and not allow_retries_on_mutations:
-        attempts_allowed = 1
-    else:
-        attempts_allowed = 1 + retries_allowed
-    # NB: attempts_allowed may be raised mid-loop; see the URLError handler below.
+    # Send and return response -- with a short retry / delay loop to give some support
+    # to network hiccups, server rate-limiting, or individual backend-node issues.
+    #
+    # A mutation that reached the server may have applied, so re-sending one risks a
+    # duplicate write. Mutations therefore get a single attempt, with one exception:
+    # a failure that is provably pre-send (see _is_connection_refused) cannot have
+    # applied anything, so it earns a retry.
+    #
+    # That exception is evaluated per failure and never folded into attempts_allowed.
+    # Widening the budget after one refused connection would let a *later*, ambiguous
+    # failure -- a timeout or 503, arriving after the request did reach the server --
+    # spend the retry it bought, which is exactly the duplicate write this guards.
+    attempts_allowed = 1 + retries_allowed
+    retries_are_safe_for_this_query = allow_retries_on_mutations or _is_query_retry_safe(query)
     attempts_tried = 0
     retry_delay_constant_delay = 5
     retry_delay_next_attempt_extra_delay = 0
     retry_delay_factor = 3
 
-    def _log_and_raise_or_retry(log_message: str, *args: object) -> None:
-        """Log error and either return if retries allowed or raise."""
+    def _log_and_raise_or_retry(
+            log_message: str,
+            *args: object,
+            failure_was_before_send: bool = False
+    ) -> None:
+        """Log error and either return if a retry is allowed or raise.
+
+        :param failure_was_before_send: True when this specific failure proves the
+        request never reached the server, which makes a retry safe even for a mutation.
+        """
+        if not (retries_are_safe_for_this_query or failure_was_before_send):
+            _log_and_raise(log_message, *args)
         if attempts_tried < attempts_allowed:
             if not skip_logging_transient_errors:
                 LOGGER.warning(log_message, *args)
@@ -535,19 +581,16 @@ def _execute_gql_query(
             )
 
         except URLError as exc:  # noqa
-            if attempts_allowed == 1 and _is_connection_refused(exc):
-                # "Connection refused" means the TCP connection was never established,
-                # so the server provably never saw this request. That makes a re-send
-                # safe even for a mutation: there is nothing on the server to duplicate.
-                # (Every other failure mode here is ambiguous -- a timeout or a dropped
-                # connection may well have left a mutation applied server-side -- which
-                # is why mutations otherwise get a single attempt.)
-                attempts_allowed = 1 + retries_allowed
+            # "Connection refused" means the TCP connection was never established, so
+            # the server provably never saw this request; there is nothing to duplicate.
+            # Every other failure here is ambiguous -- a timeout or a dropped connection
+            # may well have left a mutation applied server-side.
             _log_and_raise_or_retry(
                 "URL Error (%s); check that the network is accessible and that "
                 "the hostname is correct in Jebena API Server endpoint '%s'",
                 str(exc),
-                api_endpoint
+                api_endpoint,
+                failure_was_before_send=_is_connection_refused(exc)
             )
             continue
 
