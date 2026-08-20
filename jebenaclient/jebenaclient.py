@@ -77,13 +77,20 @@ is available by calling get_last_run_trace_id()
 #                  send GQL "variables" as a map; quieter HTTP error logging.
 # 0.10.1 20260820: Decide mutation retries per failure rather than widening the
 #                  budget; skip GQL ignored tokens when classifying a document.
-__version__ = "0.10.1"
+# 0.11.0 20260820: Honor the server's Retry-After header as the retry delay;
+#                  retry rate-limited (HTTP 429) mutations.
+# 0.12.0 20260820: Improvements for timeout and retry handling.
+__version__ = "0.12.0"
 
+import datetime
+import email.utils
 import errno
 import json
 import logging
+import math
 import os
 import pprint
+import re
 import socket
 import ssl
 import sys
@@ -98,9 +105,28 @@ from urllib.request import Request, urlopen
 
 LOGGER = logging.getLogger(__name__)
 __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None  # See get_last_run_trace_id()
-__MAX_RUN_TIME_IN_SECONDS = 60 * 5
+# How long the server has to answer one request:
+__REQUEST_TIMEOUT_IN_SECONDS = 60 * 5
 if os.getenv('JEBENA_CLIENT_TIMEOUT'):
-    __MAX_RUN_TIME_IN_SECONDS = int(os.getenv('JEBENA_CLIENT_TIMEOUT'))
+    __REQUEST_TIMEOUT_IN_SECONDS = int(os.getenv('JEBENA_CLIENT_TIMEOUT'))
+
+# One delay per retry, with a short fall-off to ride out brief instability:
+__RETRY_DELAYS_IN_SECONDS = (2, 10)
+__RETRIES_ALLOWED = len(__RETRY_DELAYS_IN_SECONDS)
+# Grace for a long Retry-After: the server may, at worst, hold us up to this many seconds
+# beyond what our own sleeps and per-request timeouts account for.
+__RUN_TIME_PADDING_IN_SECONDS = 120
+
+# Backstop against hanging forever:
+__MAX_TOTAL_RUN_TIME_IN_SECONDS = (
+    (1 + __RETRIES_ALLOWED) * __REQUEST_TIMEOUT_IN_SECONDS
+    + sum(__RETRY_DELAYS_IN_SECONDS)
+    + __RUN_TIME_PADDING_IN_SECONDS
+)
+
+# Statuses the server rejects before GraphQL runs, so a mutation cannot have applied.
+# Rate limiting is in Varnish's vcl_recv; drop 429 if a limiter ever moves into the app.
+__HTTP_STATUS_CODES_REJECTED_BEFORE_EXECUTION = (429,)
 
 
 class JebenaCliException(Exception):
@@ -169,6 +195,9 @@ def run_query(
 
     :return: GQL response as a Python dict
     """
+    global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
+    __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None
+
     # Avoid a condition where an empty query silently returns nothing:
     if not query or not query.strip():
         raise JebenaCliGQLException("Empty query.")
@@ -290,10 +319,17 @@ def get_last_run_trace_id() -> Optional[str]:
     return __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
 
 
-# Characters GraphQL treats as "ignored tokens" and permits before the first real
-# token of a document: whitespace, commas, and a leading unicode BOM. NB: str.lstrip()
-# alone will not remove the BOM, since \ufeff is not whitespace to Python.
+# GQL "ignored tokens" allowed before a document's first real token. The BOM is listed
+# explicitly because str.lstrip() does not treat \ufeff as whitespace.
 __GQL_IGNORED_CHARACTERS = " \t\r\n\f\v,\ufeff"
+__GQL_MUTATION_TOKEN = re.compile(r"(?<![A-Za-z0-9_])mutation(?![A-Za-z0-9_])", re.IGNORECASE)
+# Block strings, strings, and comments, so a scan does not match on their contents. An
+# unterminated one simply fails to match and is left in place, which errs toward unsafe.
+__GQL_STRING_OR_COMMENT = re.compile(
+    r'"""(?:.|\n)*?"""'
+    r'|"(?:\\.|[^"\\\n])*"'
+    r"|#[^\n]*"
+)
 
 
 def _strip_leading_gql_ignored_tokens(query: str) -> str:
@@ -313,20 +349,19 @@ def _strip_leading_gql_ignored_tokens(query: str) -> str:
 def _is_query_retry_safe(query: str) -> bool:
     """Return True only when a document is confidently incapable of writing.
 
-    Re-sending is safe only for documents that cannot mutate data, so this
-    deliberately fails closed: anything not positively recognized as a query --
-    including anything we cannot confidently scan -- is treated as a mutation and
-    gets a single attempt. Being wrong in that direction costs a retry on a read;
-    being wrong in the other direction risks a duplicate write.
-
-    NB: a document whose first definition is a fragment is therefore treated as
-    unsafe, even when the operation it precedes is a query.
+    Fails closed: anything not positively recognized as a query -- including a
+    fragment-first document, and anything unscannable -- is treated as a mutation.
+    Being wrong that way costs a retry on a read; the other way risks a duplicate write.
     """
     document = _strip_leading_gql_ignored_tokens(query)
+    # A document may hold several operations, with operation_name choosing which one runs,
+    # so a mutation anywhere in it can be the one that executes. NB a field named
+    # "mutation" nested inside a query also matches; that costs a retry on a read.
+    if __GQL_MUTATION_TOKEN.search(__GQL_STRING_OR_COMMENT.sub(" ", document)):
+        return False
     if document.startswith("{"):
-        # Anonymous shorthand query, e.g. "{ me { person { displayName } } }". A
-        # wrapped-query JSON object also starts with "{", and may well wrap a
-        # mutation, so require an inner token that could begin a selection set:
+        # Anonymous shorthand query. A wrapped-query JSON object also starts with "{"
+        # and may wrap a mutation, so require a token that could begin a selection set:
         inner = _strip_leading_gql_ignored_tokens(document[1:])
         return bool(inner) and not inner.startswith(('"', "'"))
     if not document.lower().startswith("query"):
@@ -336,17 +371,52 @@ def _is_query_retry_safe(query: str) -> bool:
     return not remainder or not (remainder[0].isalnum() or remainder[0] == "_")
 
 
+def _http_date_delay_in_seconds(raw_value: object) -> Optional[float]:
+    """Return the seconds until an HTTP-date, or None if it will not parse."""
+    try:
+        when = email.utils.parsedate_to_datetime(str(raw_value))
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+
+
+def _get_retry_after_in_seconds(exc: HTTPError) -> Optional[int]:
+    """Return the server's advertised Retry-After delay in seconds, or None.
+
+    Handles both forms RFC 7231 allows: whole seconds (a fractional value is accepted
+    and rounded up) and an HTTP-date, which is measured against now.
+    """
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        return None
+    raw_value = headers.get("Retry-After")
+    if raw_value is None:
+        return None
+    try:
+        seconds = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        seconds = _http_date_delay_in_seconds(raw_value)
+    if seconds is None:
+        LOGGER.debug("Ignoring unparseable Retry-After header: %r", raw_value)
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        LOGGER.debug("Ignoring out-of-range Retry-After header: %r", raw_value)
+        return None
+    return math.ceil(seconds)
+
+
 def _is_connection_refused(exc: URLError) -> bool:
     """Return True when a URLError was caused by the connection being refused.
 
-    ECONNREFUSED means the peer answered our TCP SYN with a RST: no socket was
-    ever opened and no bytes were ever sent, so the request provably did not run.
+    ECONNREFUSED means no socket opened and no bytes were sent, so nothing ran.
     """
     reason = getattr(exc, "reason", None)
     if isinstance(reason, socket.gaierror):
-        # DNS failures carry EAI_* codes in .errno, which share a number space
-        # with the errno codes we're testing for here. Never confuse the two.
-        return False
+        return False  # gaierror puts EAI_* codes in .errno, sharing errno's number space.
     return getattr(reason, "errno", None) == errno.ECONNREFUSED
 
 
@@ -358,7 +428,7 @@ def _execute_gql_query(
         allow_insecure_https: bool = False,
         api_key_name: Optional[str] = None,
         api_secret_key: Optional[str] = None,
-        retries_allowed: int = 2,
+        retries_allowed: int = __RETRIES_ALLOWED,
         allow_retries_on_mutations: bool = False,
         skip_logging_transient_errors: bool = False
 ) -> dict:
@@ -405,34 +475,27 @@ def _execute_gql_query(
         headers=headers
     )
 
-    # Send and return response -- with a short retry / delay loop to give some support
-    # to network hiccups, server rate-limiting, or individual backend-node issues.
+    # Retry loop, for network hiccups, rate-limiting, and single-node issues.
     #
-    # A mutation that reached the server may have applied, so re-sending one risks a
-    # duplicate write. Mutations therefore get a single attempt, with one exception:
-    # a failure that is provably pre-send (see _is_connection_refused) cannot have
-    # applied anything, so it earns a retry.
-    #
-    # That exception is evaluated per failure and never folded into attempts_allowed.
-    # Widening the budget after one refused connection would let a *later*, ambiguous
-    # failure -- a timeout or 503, arriving after the request did reach the server --
-    # spend the retry it bought, which is exactly the duplicate write this guards.
+    # A mutation that reached the server may have applied, so mutations get one attempt
+    # unless the failure is provably pre-send.
     attempts_allowed = 1 + retries_allowed
     retries_are_safe_for_this_query = allow_retries_on_mutations or _is_query_retry_safe(query)
     attempts_tried = 0
-    retry_delay_constant_delay = 5
-    retry_delay_next_attempt_extra_delay = 0
-    retry_delay_factor = 3
+    retry_delay_requested_by_server = None
+    query_started_at = time.monotonic()
+    global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
+    __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None
 
     def _log_and_raise_or_retry(
             log_message: str,
             *args: object,
             failure_was_before_send: bool = False
     ) -> None:
-        """Log error and either return if a retry is allowed or raise.
+        """Log error and either return if a retry is allowed, or raise.
 
-        :param failure_was_before_send: True when this specific failure proves the
-        request never reached the server, which makes a retry safe even for a mutation.
+        :param failure_was_before_send: this failure proves the request never reached
+        the server, making a retry safe even for a mutation.
         """
         if not (retries_are_safe_for_this_query or failure_was_before_send):
             _log_and_raise(log_message, *args)
@@ -452,11 +515,26 @@ def _execute_gql_query(
         attempts_tried += 1
         LOGGER.debug("Sending query; attempt %s of %s", attempts_tried, attempts_allowed)
         if attempts_tried > 1:
-            # When re-attempting query, issue a warning and wait a bit before retrying:
-            retry_delay = retry_delay_constant_delay + \
-                          retry_delay_next_attempt_extra_delay + \
-                          retry_delay_factor ** attempts_tried
-            retry_delay_next_attempt_extra_delay = 0
+            retry_delay = __RETRY_DELAYS_IN_SECONDS[
+                min(attempts_tried - 2, len(__RETRY_DELAYS_IN_SECONDS) - 1)
+            ]
+            # Prefer the server's own delay when it sends one, plus a second: the header
+            # may be rounded down, and we may not even hit the same Varnish node twice --
+            # they are not synced, so another node's block can outlast the one we were told.
+            if retry_delay_requested_by_server is not None:
+                retry_delay = retry_delay_requested_by_server + 1
+                retry_delay_requested_by_server = None
+            # Reserve the attempt itself, not just the sleep, or the watchdog can fire
+            # mid-request and hard-exit with no diagnostics:
+            seconds_left = __MAX_TOTAL_RUN_TIME_IN_SECONDS - (time.monotonic() - query_started_at)
+            if retry_delay + __REQUEST_TIMEOUT_IN_SECONDS >= seconds_left:
+                _log_and_raise(
+                    "Giving up on Jebena API Server %s: waiting %s seconds and retrying would "
+                    "run past this client's %s second limit on a single run.",
+                    api_endpoint,
+                    retry_delay,
+                    __MAX_TOTAL_RUN_TIME_IN_SECONDS
+                )
             if not skip_logging_transient_errors:
                 LOGGER.warning(
                     "Jebena client failed to fetch from %s; retry in %s seconds; %s attempts left.",
@@ -466,7 +544,7 @@ def _execute_gql_query(
                 )
             time.sleep(retry_delay)
 
-        start_time = time.time()
+        start_time = time.monotonic()
         try:
             context = None
             if allow_insecure_https:
@@ -481,10 +559,9 @@ def _execute_gql_query(
             response = urlopen(
                 req,
                 context=context,
-                timeout=__MAX_RUN_TIME_IN_SECONDS
+                timeout=__REQUEST_TIMEOUT_IN_SECONDS
             )  # nosec
             LOGGER.debug("Finished urlopen(...)")
-            global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
             # HTTPMessage.__getitem__ returns None for a header the server didn't send,
             # so no guard is needed here:
             __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = response.info()["X-Log-Trace-ID"]
@@ -512,15 +589,22 @@ def _execute_gql_query(
                 )
 
         except socket.timeout:
-            run_time = int(time.time() - start_time)
+            run_time = int(time.monotonic() - start_time)
             _log_and_raise_or_retry(
                 "Socket Timeout error after %s seconds; max allowed is %s. (Hint: set ENV JEBENA_CLIENT_TIMEOUT)",
                 run_time,
-                __MAX_RUN_TIME_IN_SECONDS
+                __REQUEST_TIMEOUT_IN_SECONDS
             )
             continue
 
         except HTTPError as exc:  # noqa
+            __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = (
+                getattr(exc, "headers", None) or {}
+            ).get("X-Log-Trace-ID")
+            retry_delay_requested_by_server = _get_retry_after_in_seconds(exc)
+            was_rejected_before_execution = (
+                exc.code in __HTTP_STATUS_CODES_REJECTED_BEFORE_EXECUTION
+            )
             if exc.code == 401:
                 # Regardless of retries left, always raise when using an unauthorized key:
                 time.sleep(1)  # Delay a little on 401; in case we are called inside a loop
@@ -534,21 +618,13 @@ def _execute_gql_query(
             if exc.code == 429:
                 _log_and_raise_or_retry(
                     "Jebena API Server %s has rate-limited the request.",
-                    api_endpoint
+                    api_endpoint,
+                    failure_was_before_send=was_rejected_before_execution
                 )
-                retry_delay_next_attempt_extra_delay = 10
                 continue
 
-            # The response document may be a Jebena API Server error document, like so:
-            #    {
-            #      "details": {"errorType":"http",
-            #                  "message":"Api-key not found.",
-            #                  "status":401},
-            #      "message":"Api-key not found.",
-            #      "status":401
-            #    }
-            # The server's own message is already in there, so we surface the body
-            # verbatim below rather than re-formatting it.
+            # The body may be a server error document ({"message": ..., "status": ...});
+            # it already carries the server's own message, so surface it verbatim.
             response_body = "(Non-UTF-8 response)"
             try:
                 response_body = exc.read().decode("utf-8", "replace")
@@ -581,10 +657,8 @@ def _execute_gql_query(
             )
 
         except URLError as exc:  # noqa
-            # "Connection refused" means the TCP connection was never established, so
-            # the server provably never saw this request; there is nothing to duplicate.
-            # Every other failure here is ambiguous -- a timeout or a dropped connection
-            # may well have left a mutation applied server-side.
+            # Only ECONNREFUSED proves the request never landed; every other URLError
+            # here is ambiguous.
             _log_and_raise_or_retry(
                 "URL Error (%s); check that the network is accessible and that "
                 "the hostname is correct in Jebena API Server endpoint '%s'",
@@ -661,12 +735,16 @@ def read_from_stdin(user_prompt: Optional[str] = None) -> str:
 def __exit_client() -> NoReturn:
     """Terminates python with non-zero exit code when we're run as a command-line."""
     print(
-        "Error: Request terminated. Jebena client exceeded max run time (%s seconds). "
-        "This typically means the API server was unable to generate a response within a reasonable time. "
-        "Check that the GQL query isn't over-fetching. It's also possible that more involved API calls may "
-        "take longer than expected, in which case try temporarily increasing the timeout by setting the "
-        "ENV variable 'JEBENA_CLIENT_TIMEOUT' in your shell: export JEBENA_CLIENT_TIMEOUT=%s"
-        % (__MAX_RUN_TIME_IN_SECONDS, __MAX_RUN_TIME_IN_SECONDS * 2),
+        "Error: Request terminated after %s seconds. The Jebena API Server did not answer "
+        "within %s seconds on any of %s attempts; check that the GQL query isn't over-fetching. "
+        "If the query legitimately needs longer, raise the per-request timeout: "
+        "export JEBENA_CLIENT_TIMEOUT=%s"
+        % (
+            __MAX_TOTAL_RUN_TIME_IN_SECONDS,
+            __REQUEST_TIMEOUT_IN_SECONDS,
+            1 + __RETRIES_ALLOWED,
+            __REQUEST_TIMEOUT_IN_SECONDS * 2,
+        ),
         file=sys.stderr
     )
     os._exit(3)  # noqa
@@ -679,7 +757,7 @@ def main() -> None:
     We place the main function here so that users can use this single .py file directly.
     """
     # Run read_query_and_return_response() with a watcher thread to terminate too-slow runs.
-    watcher = Timer(__MAX_RUN_TIME_IN_SECONDS, __exit_client)
+    watcher = Timer(__MAX_TOTAL_RUN_TIME_IN_SECONDS, __exit_client)
     try:
         # We limit runtime to prevent hangs on failed network connection or bad GQL queries:
         watcher.start()

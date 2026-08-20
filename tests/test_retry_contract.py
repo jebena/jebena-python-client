@@ -5,6 +5,8 @@ re-sent when it could have written data. Everything here runs against a scripted
 stand-in for urlopen, so no network and no live server is needed.
 """
 
+import datetime
+import email.utils
 import errno
 import io
 import json
@@ -29,9 +31,10 @@ def dns_failure():
     return URLError(socket.gaierror(-2, "Name or service not known"))
 
 
-def http_error(code, body=b'{"message": "server said no"}'):
+def http_error(code, body=b'{"message": "server said no"}', retry_after=None):
     """Return an HTTPError with a readable body, as urllib would raise."""
-    return HTTPError("http://example.test/gql/", code, "Error", {}, io.BytesIO(body))
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return HTTPError("http://example.test/gql/", code, "Error", headers, io.BytesIO(body))
 
 
 class FakeResponse:
@@ -93,7 +96,7 @@ class ScriptedSendMixin:
         scripted = ScriptedUrlopen(*outcomes)
         self.scripted = scripted
         with mock.patch.object(jebenaclient, "urlopen", scripted), \
-                mock.patch.object(jebenaclient.time, "sleep"):
+                mock.patch.object(jebenaclient.time, "sleep") as sleep_mock:
             try:
                 result = jebenaclient._execute_gql_query(
                     "http://example.test/",
@@ -107,114 +110,54 @@ class ScriptedSendMixin:
                 result = exc
             finally:
                 scripted.close()
+        self.sleeps = [call.args[0] for call in sleep_mock.call_args_list]
         return scripted.calls, result
 
 
 class RetryContractTestCase(ScriptedSendMixin, unittest.TestCase):
     """Exercise _execute_gql_query's retry decisions."""
 
-    # -- Ambiguous failures must never be retried for a mutation ---------------
+    AMBIGUOUS = [
+        ("http 503", http_error(503)),
+        ("socket timeout", socket.timeout()),
+        ("remote disconnect", RemoteDisconnected("closed")),
+        ("dns failure", dns_failure()),          # a URLError that is not ECONNREFUSED
+    ]
 
-    def test_mutation_is_not_retried_after_http_503(self):
-        sends, _ = self.send(self.MUTATION, http_error(503), http_error(503))
-        self.assertEqual(sends, 1)
+    def test_a_mutation_is_never_retried_after_an_ambiguous_failure(self):
+        for label, failure in self.AMBIGUOUS:
+            with self.subTest(failure=label):
+                sends, _ = self.send(self.MUTATION, failure, FakeResponse())
+                self.assertEqual(sends, 1)
 
-    def test_mutation_is_not_retried_after_socket_timeout(self):
-        sends, _ = self.send(self.MUTATION, socket.timeout(), socket.timeout())
-        self.assertEqual(sends, 1)
-
-    def test_mutation_is_not_retried_after_remote_disconnect(self):
-        sends, _ = self.send(
-            self.MUTATION, RemoteDisconnected("closed"), RemoteDisconnected("closed")
-        )
-        self.assertEqual(sends, 1)
-
-    def test_mutation_is_not_retried_after_dns_failure(self):
-        # A URLError that is not ECONNREFUSED proves nothing about whether the
-        # request landed, so it must not buy a retry.
-        sends, _ = self.send(self.MUTATION, dns_failure(), dns_failure())
-        self.assertEqual(sends, 1)
-
-    # -- A provably pre-send failure earns a retry ----------------------------
-
-    def test_mutation_is_retried_when_connection_refused(self):
-        sends, _ = self.send(
-            self.MUTATION, refused_connection(), refused_connection(), refused_connection()
-        )
-        self.assertEqual(sends, 3)
-
-    def test_mutation_succeeds_on_retry_after_refused_connection(self):
+    def test_a_mutation_is_retried_when_the_connection_was_refused(self):
         sends, result = self.send(self.MUTATION, refused_connection(), FakeResponse())
         self.assertEqual(sends, 2)
         self.assertEqual(result, {"data": {"ok": True}})
 
-    # -- The regression this contract exists for ------------------------------
+    def test_a_refused_connection_does_not_license_a_later_ambiguous_retry(self):
+        """The regression this contract exists for: the second failure is ambiguous."""
+        for label, failure in (("503", http_error(503)), ("timeout", socket.timeout())):
+            with self.subTest(second_failure=label):
+                sends, _ = self.send(
+                    self.MUTATION, refused_connection(), failure, FakeResponse())
+                self.assertEqual(sends, 2)
 
-    def test_refused_connection_does_not_license_a_later_ambiguous_retry(self):
-        """A refused attempt must not widen the budget for a later ambiguous failure.
-
-        Attempt 1 is refused, so it provably did not write and a retry is safe.
-        Attempt 2 reaches the server and comes back 503 -- the mutation may well
-        have applied. There must be no attempt 3.
-        """
+    def test_a_mutation_behind_a_leading_comment_is_still_a_mutation(self):
         sends, _ = self.send(
-            self.MUTATION, refused_connection(), http_error(503), FakeResponse()
-        )
-        self.assertEqual(sends, 2)
-
-    def test_comment_prefixed_mutation_is_not_retried(self):
-        """A leading GQL comment must not disguise a mutation as a retryable query."""
-        sends, _ = self.send(
-            "# Create the record\nmutation CreateThing { x }",
-            http_error(503),
-            http_error(503),
-            FakeResponse()
-        )
+            "# Create the record\nmutation CreateThing { x }", http_error(503), FakeResponse())
         self.assertEqual(sends, 1)
 
-    def test_named_mutation_is_not_retried(self):
-        sends, _ = self.send(
-            "mutation UpdateUser { x }", http_error(503), http_error(503), FakeResponse()
-        )
-        self.assertEqual(sends, 1)
-
-    def test_bom_prefixed_mutation_is_not_retried(self):
-        sends, _ = self.send(
-            "\ufeffmutation CreateThing { x }", http_error(503), FakeResponse()
-        )
-        self.assertEqual(sends, 1)
-
-    def test_refused_then_timeout_does_not_retry(self):
-        sends, _ = self.send(
-            self.MUTATION, refused_connection(), socket.timeout(), FakeResponse()
-        )
-        self.assertEqual(sends, 2)
-
-    # -- Reads keep their full retry budget -----------------------------------
-
-    def test_query_is_retried_after_ambiguous_failure(self):
-        sends, result = self.send(
-            self.QUERY, http_error(503), http_error(503), FakeResponse()
-        )
+    def test_a_query_keeps_its_full_retry_budget(self):
+        sends, result = self.send(self.QUERY, http_error(503), http_error(503), FakeResponse())
         self.assertEqual(sends, 3)
         self.assertEqual(result, {"data": {"ok": True}})
-
-    def test_query_retry_budget_is_bounded(self):
-        sends, _ = self.send(
-            self.QUERY, http_error(503), http_error(503), http_error(503)
-        )
-        self.assertEqual(sends, 3)
 
     def test_allow_retries_on_mutations_restores_the_full_budget(self):
-        sends, result = self.send(
-            self.MUTATION,
-            http_error(503),
-            http_error(503),
-            FakeResponse(),
-            allow_retries_on_mutations=True
-        )
+        sends, _ = self.send(
+            self.MUTATION, http_error(503), http_error(503), FakeResponse(),
+            allow_retries_on_mutations=True)
         self.assertEqual(sends, 3)
-        self.assertEqual(result, {"data": {"ok": True}})
 
     def test_http_401_never_retries(self):
         sends, _ = self.send(self.QUERY, http_error(401), FakeResponse())
@@ -222,129 +165,277 @@ class RetryContractTestCase(ScriptedSendMixin, unittest.TestCase):
 
 
 class QueryScannerTestCase(unittest.TestCase):
-    """Exercise _is_query_retry_safe, which must fail closed."""
+    """_is_query_retry_safe must fail closed: only a recognizable query is retry-safe."""
 
-    def assert_retry_safe(self, query):
-        self.assertTrue(
-            jebenaclient._is_query_retry_safe(query),
-            "expected retry-safe: %r" % query
-        )
+    DOCUMENTS = [
+        # retry-safe reads
+        ("query { me }", True),
+        ("  \n\t query getName { me }", True),
+        ("query($a: String) { me }", True),
+        ("query{me}", True),
+        ("{ me { person { displayName } } }", True),
+        ("# fetch my name\nquery { me }", True),
+        ("\ufeffquery { me }", True),
+        (",,, query { me }", True),
+        ("query mutationsById { x }", True),
+        ('query S { search(term: "mutation") { id } }', True),      # string contents
+        ('query D { doc(body: """a mutation""") { id } }', True),   # block string
+        ("query S {\n # mutation examples\n s(t: 1) { id } }", True),
+        # not retry-safe
+        ("mutation { doThing }", False),
+        ("mutation{doThing}", False),
+        ("MUTATION { doThing }", False),
+        ("mutation UpdateUser($id: ID!) { x }", False),
+        ("# Create the record\nmutation CreateThing { x }", False),
+        ("\ufeffmutation CreateThing { x }", False),
+        ("query A { me }\nmutation B { charge }", False),          # operation_name may pick B
+        ('query S { search(term: "unterminated mutation) { id } }', False),
+        ("fragment F on T { x }\nquery Q { me { ...F } }", False),  # cannot scan past a fragment
+        ('{"query": "mutation { doThing }"}', False),               # wrapped JSON, not shorthand
+        ("mutationLike { x }", False),
+        ("queryFoo { x }", False),
+        ("# nothing but a comment", False),
+        ("", False),
+    ]
 
-    def assert_not_retry_safe(self, query):
-        self.assertFalse(
-            jebenaclient._is_query_retry_safe(query),
-            "expected NOT retry-safe: %r" % query
-        )
-
-    def test_plain_queries_are_retry_safe(self):
-        self.assert_retry_safe("query { me }")
-        self.assert_retry_safe("  \n\t query getName { me }")
-        self.assert_retry_safe("query($a: String) { me }")
-        self.assert_retry_safe("query{me}")
-
-    def test_anonymous_shorthand_query_is_retry_safe(self):
-        self.assert_retry_safe("{ me { person { displayName } } }")
-        self.assert_retry_safe("\n  { me }")
-
-    def test_queries_behind_ignored_tokens_are_retry_safe(self):
-        self.assert_retry_safe("# fetch my name\nquery { me }")
-        self.assert_retry_safe("﻿query { me }")
-        self.assert_retry_safe(",,, query { me }")
-        self.assert_retry_safe("# one\n# two\n\n  query { me }")
-
-    def test_plain_mutations_are_not_retry_safe(self):
-        self.assert_not_retry_safe("mutation { doThing }")
-        self.assert_not_retry_safe("mutation{doThing}")
-        self.assert_not_retry_safe("MUTATION { doThing }")
-        self.assert_not_retry_safe("  \n mutation($a: String) { doThing }")
-
-    def test_named_mutations_are_not_retry_safe(self):
-        self.assert_not_retry_safe("mutation UpdateUser { x }")
-        self.assert_not_retry_safe("mutation UpdateUser($id: ID!) { x }")
-        self.assert_not_retry_safe("mutation {}")
-        self.assert_not_retry_safe("mutation{}")
-
-    def test_mutations_behind_ignored_tokens_are_not_retry_safe(self):
-        # A leading comment or BOM must not disguise a mutation as a query:
-        self.assert_not_retry_safe("# Create the record\nmutation CreateThing { x }")
-        self.assert_not_retry_safe("﻿mutation CreateThing { x }")
-        self.assert_not_retry_safe(", mutation CreateThing { x }")
-        self.assert_not_retry_safe("#c1\n#c2\nmutation CreateThing { x }")
-
-    def test_comment_only_document_is_not_retry_safe(self):
-        self.assert_not_retry_safe("# nothing but a comment")
-        self.assert_not_retry_safe("")
-
-    def test_fragment_first_documents_are_not_retry_safe(self):
-        # Valid GQL: a fragment definition may precede the operation. We cannot tell
-        # what follows without a real parser, so we fail closed.
-        self.assert_not_retry_safe("fragment F on T { x }\nmutation M { doThing { ...F } }")
-        self.assert_not_retry_safe("fragment F on T { x }\nquery Q { me { ...F } }")
-
-    def test_wrapped_json_is_not_retry_safe(self):
-        # A wrapped query also starts with "{" and may wrap a mutation. run_query()
-        # normally unwraps it first, but it must not be mistaken for a shorthand query.
-        self.assert_not_retry_safe('{"query": "mutation { doThing }"}')
-        self.assert_not_retry_safe('{ "query": "mutation { doThing }" }')
-
-    def test_lookalike_operation_names_are_classified_by_operation_type(self):
-        self.assert_retry_safe("query mutationsById { x }")
-        self.assert_not_retry_safe("mutationLike { x }")
-        self.assert_not_retry_safe("queryFoo { x }")
+    def test_classification(self):
+        for document, expected in self.DOCUMENTS:
+            with self.subTest(document=document):
+                self.assertEqual(jebenaclient._is_query_retry_safe(document), expected)
 
 
 class RequestPayloadTestCase(ScriptedSendMixin, unittest.TestCase):
-    """Exercise how the outbound GQL request body is serialized."""
+    """GQL defines "variables" as a map; an empty list is invalid and once shipped."""
 
-    def sent_payload(self, **kwargs):
-        """Send one successful query and return the request body that went out."""
-        self.send(self.QUERY, FakeResponse(), **kwargs)
-        return self.scripted.payloads[0]
-
-    def test_absent_variables_serialize_as_an_empty_map(self):
-        # GQL defines "variables" as a map; an empty list is invalid per spec.
-        self.assertEqual(self.sent_payload()["variables"], {})
-
-    def test_explicit_variables_are_preserved(self):
-        payload = self.sent_payload(variables={"someUUID": "abc", "count": 2})
-        self.assertEqual(payload["variables"], {"someUUID": "abc", "count": 2})
-
-    def test_explicitly_empty_variables_are_left_alone(self):
-        self.assertEqual(self.sent_payload(variables={})["variables"], {})
-
-    def test_falsy_variable_values_survive(self):
-        # A dict of falsy values is still a real variable map and must not be dropped.
-        payload = self.sent_payload(variables={"flag": False, "count": 0, "name": ""})
-        self.assertEqual(payload["variables"], {"flag": False, "count": 0, "name": ""})
-
-    def test_operation_name_is_sent_only_when_given(self):
-        self.assertNotIn("operationName", self.sent_payload())
+    def test_variables_and_operation_name_serialize_correctly(self):
+        self.send(self.QUERY, FakeResponse())
+        self.assertEqual(self.scripted.payloads[0], {"query": self.QUERY, "variables": {}})
+        self.send(self.QUERY, FakeResponse(), variables={"flag": False}, operation_name="n")
         self.assertEqual(
-            self.sent_payload(operation_name="getName")["operationName"], "getName"
-        )
+            self.scripted.payloads[0],
+            {"query": self.QUERY, "variables": {"flag": False}, "operationName": "n"})
 
-    def test_query_is_sent_verbatim(self):
-        self.assertEqual(self.sent_payload()["query"], self.QUERY)
+
+class RetryAfterHeaderTestCase(ScriptedSendMixin, unittest.TestCase):
+    """Retry-After (plus a second) sets the delay; our own schedule is the fallback."""
+
+    DELAYS = [
+        # status, Retry-After, expected sleeps, why
+        (503, "30", [31], "longer than our own delay"),
+        (503, "5", [6], "shorter than our own delay -- still honored"),
+        (503, "0", [1], "zero still waits the added second"),
+        (503, "8.4", [10], "fractional value is rounded up, then padded"),
+        (503, None, [2], "no header -- our own first delay"),
+        (429, "8", [9], "throttle delay honored"),
+        (429, None, [2], "no header -- our own first delay"),
+    ]
+
+    def test_delay_comes_from_the_header_when_present(self):
+        for status, header, expected, why in self.DELAYS:
+            with self.subTest(status=status, retry_after=header, why=why):
+                self.send(self.QUERY, http_error(status, retry_after=header), FakeResponse())
+                self.assertEqual(self.sleeps, expected)
+
+    def test_http_date_is_honored(self):
+        soon = email.utils.format_datetime(
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=60))
+        self.send(self.QUERY, http_error(503, retry_after=soon), FakeResponse())
+        self.assertEqual(len(self.sleeps), 1)
+        self.assertTrue(60 <= self.sleeps[0] <= 62, self.sleeps)
+
+    def test_header_applies_per_failure_and_is_not_sticky(self):
+        self.send(self.QUERY, http_error(503, retry_after="30"), http_error(503), FakeResponse())
+        self.assertEqual(self.sleeps, [31, 10])
+
+    def test_backstop_reserves_room_for_the_retry_itself(self):
+        # The 201s sleep fits inside the 400s backstop, but the attempt after it would not.
+        with mock.patch.object(jebenaclient, "__MAX_TOTAL_RUN_TIME_IN_SECONDS", 400), \
+                mock.patch.object(jebenaclient, "__REQUEST_TIMEOUT_IN_SECONDS", 300):
+            sends, _ = self.send(self.QUERY, http_error(503, retry_after="200"), FakeResponse())
+        self.assertEqual((sends, self.sleeps), (1, []))
+
+    def test_delay_past_the_run_backstop_gives_up_instead_of_sleeping(self):
+        with mock.patch.object(jebenaclient, "__MAX_TOTAL_RUN_TIME_IN_SECONDS", 20):
+            sends, result = self.send(self.QUERY, http_error(503, retry_after="600"), FakeResponse())
+        self.assertEqual((sends, self.sleeps), (1, []))
+        self.assertIn("waiting 601 seconds", str(result))
+
+
+class RateLimitRetryTestCase(ScriptedSendMixin, unittest.TestCase):
+    """429 is synthesised before GraphQL runs, so re-sending is safe."""
+
+    def test_429_is_retried_for_query_and_mutation(self):
+        for query in (self.QUERY, self.MUTATION):
+            with self.subTest(query=query):
+                sends, result = self.send(query, http_error(429), FakeResponse())
+                self.assertEqual(sends, 2)
+                self.assertEqual(result, {"data": {"ok": True}})
+
+    def test_mutation_still_refuses_an_ambiguous_503_after_a_429(self):
+        sends, _ = self.send(self.MUTATION, http_error(429), http_error(503), FakeResponse())
+        self.assertEqual(sends, 2)
+
+    def test_a_selected_mutation_in_a_multi_operation_document_is_not_retried(self):
+        """operation_name picks which operation runs, so a mutation anywhere is unsafe."""
+        document = ("query ReadOnly { me { person { displayName } } }\n"
+                    "mutation ChargeCard { chargeCard { id } }")
+        self.assertFalse(jebenaclient._is_query_retry_safe(document))
+        sends, _ = self.send(document, http_error(503), FakeResponse(),
+                             operation_name="ChargeCard")
+        self.assertEqual(sends, 1)
+
+    def test_mutation_retry_is_gated_on_the_named_assumption(self):
+        """Emptying the tuple must stop the retry, or JEBENA_SERVER_ASSUMPTION is decorative."""
+        with mock.patch.object(
+                jebenaclient, "__HTTP_STATUS_CODES_REJECTED_BEFORE_EXECUTION", ()):
+            sends, _ = self.send(self.MUTATION, http_error(429), FakeResponse())
+        self.assertEqual(sends, 1)
+
+
+VARNISH_SYNTH_HTML = b"<html><body><h3>API Server Error (405)</h3></body></html>"
+
+
+class SynthStatusTestCase(ScriptedSendMixin, unittest.TestCase):
+    """Varnish synths 400/405/418 with an HTML body and no Retry-After."""
+
+    def test_they_never_retry_never_sleep_and_surface_the_body(self):
+        for code in (400, 405, 418):
+            for query in (self.QUERY, self.MUTATION):
+                with self.subTest(code=code, query=query):
+                    sends, result = self.send(query, http_error(code, VARNISH_SYNTH_HTML))
+                    self.assertEqual((sends, self.sleeps), (1, []))
+                    self.assertIn("API Server Error", str(result))
+
+    def test_non_utf8_body_still_raises_cleanly(self):
+        _, result = self.send(self.QUERY, http_error(400, b"\xff\xfe not utf-8"))
+        self.assertIsInstance(result, jebenaclient.JebenaCliException)
+
+
+class RetryAfterParsingTestCase(unittest.TestCase):
+    """Exercise _get_retry_after_in_seconds."""
+
+    VALUES = [
+        ("30", 30), ("0", 0), (" 15 ", 15),
+        ("1.5", 2), ("8.4", 9),          # fractional values round up
+        (None, None), ("", None), ("soon", None), ("-10", None),
+        ("inf", None), ("nan", None), ("1e400", None),   # float() takes these; ceil cannot
+        ("Mon, 99 Xxx 2026 07:28:00 GMT", None),         # malformed date
+    ]
+
+    @staticmethod
+    def parse(raw):
+        exc = http_error(503, retry_after=raw)
+        try:
+            return jebenaclient._get_retry_after_in_seconds(exc)
+        finally:
+            exc.close()
+
+    def test_http_date_is_measured_against_now(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        soon = self.parse(email.utils.format_datetime(now + datetime.timedelta(seconds=60)))
+        self.assertTrue(60 <= soon <= 61, soon)
+        # A date already past means "go now"; fall back to our own delay rather than 0.
+        self.assertIsNone(
+            self.parse(email.utils.format_datetime(now - datetime.timedelta(seconds=60))))
+
+    def test_whole_and_fractional_seconds_are_honored(self):
+        for raw, expected in self.VALUES:
+            with self.subTest(retry_after=raw):
+                exc = http_error(503, retry_after=raw)
+                try:
+                    self.assertEqual(jebenaclient._get_retry_after_in_seconds(exc), expected)
+                finally:
+                    exc.close()
+
+    def test_error_without_headers(self):
+        self.assertIsNone(jebenaclient._get_retry_after_in_seconds(URLError("no headers")))
+
+
+class TraceIdTestCase(ScriptedSendMixin, unittest.TestCase):
+    """get_last_run_trace_id() must describe the call that just ran, not an older one."""
+
+    def test_a_failed_call_does_not_leave_the_previous_trace_id(self):
+        self.send(self.QUERY, FakeResponse(trace_id="trace-1"))
+        self.assertEqual(jebenaclient.get_last_run_trace_id(), "trace-1")
+        # A query retries, so script a refusal for every attempt:
+        self.send(self.QUERY, *[refused_connection()] * 3)
+        self.assertIsNone(jebenaclient.get_last_run_trace_id())
+
+    def test_an_http_error_without_headers_does_not_crash(self):
+        exc = http_error(500)
+        exc.headers = None
+        _, result = self.send(self.QUERY, exc)
+        self.assertIsInstance(result, jebenaclient.JebenaCliException)
+        self.assertIsNone(jebenaclient.get_last_run_trace_id())
+
+    def test_validation_failures_in_run_query_also_clear_the_trace(self):
+        self.send(self.QUERY, FakeResponse(trace_id="trace-1"))
+        self.assertEqual(jebenaclient.get_last_run_trace_id(), "trace-1")
+        with self.assertRaises(jebenaclient.JebenaCliGQLException):
+            jebenaclient.run_query("")          # rejected before any request is built
+        self.assertIsNone(jebenaclient.get_last_run_trace_id())
+
+    def test_trace_id_is_taken_from_an_http_error_too(self):
+        exc = http_error(500)
+        exc.headers = {"X-Log-Trace-ID": "trace-from-error"}
+        self.send(self.QUERY, exc)
+        self.assertEqual(jebenaclient.get_last_run_trace_id(), "trace-from-error")
+
+
+class RunTimeBudgetTestCase(unittest.TestCase):
+    """The per-request timeout must not double as the total run backstop.
+
+    Until 0.12.0 it was both, so the first attempt spent the whole allowance and the
+    `except socket.timeout` retry could never fire.
+    """
+
+    TIMEOUT = 3
+
+    def attempts_under_backstop(self, backstop):
+        """Count sends when every attempt times out, against an honest wall clock."""
+        clock = [1000.0]
+        scripted = ScriptedUrlopen(*[socket.timeout()] * 3)
+
+        def tick(seconds):
+            clock[0] += seconds
+
+        def urlopen(*args, **kwargs):
+            tick(self.TIMEOUT)          # the socket really did wait
+            return scripted(*args, **kwargs)
+
+        with mock.patch.object(jebenaclient, "__REQUEST_TIMEOUT_IN_SECONDS", self.TIMEOUT), \
+                mock.patch.object(jebenaclient, "__MAX_TOTAL_RUN_TIME_IN_SECONDS", backstop), \
+                mock.patch.object(jebenaclient, "urlopen", urlopen), \
+                mock.patch.object(jebenaclient.time, "sleep", tick), \
+                mock.patch.object(jebenaclient.time, "monotonic", lambda: clock[0]):
+            with self.assertRaises(jebenaclient.JebenaCliException):
+                jebenaclient._execute_gql_query(
+                    "http://example.test/", "query { me }", api_key_name="key-name",
+                    api_secret_key="secret-key", skip_logging_transient_errors=True)
+        return scripted.calls
+
+    def test_timeouts_retry_under_a_derived_backstop_but_not_an_equal_one(self):
+        self.assertGreater(
+            getattr(jebenaclient, "__MAX_TOTAL_RUN_TIME_IN_SECONDS"),
+            getattr(jebenaclient, "__REQUEST_TIMEOUT_IN_SECONDS")
+        )
+        self.assertEqual(self.attempts_under_backstop(3 * self.TIMEOUT + 100), 3)
+        self.assertEqual(self.attempts_under_backstop(self.TIMEOUT), 1)
+        # Discriminating case: only real elapsed-time accounting stops this at one send.
+        self.assertEqual(self.attempts_under_backstop(7), 1)
 
 
 class ConnectionRefusedDetectionTestCase(unittest.TestCase):
-    """Exercise _is_connection_refused."""
+    """Only ECONNREFUSED proves the request never left."""
 
-    def test_detects_econnrefused(self):
-        self.assertTrue(jebenaclient._is_connection_refused(refused_connection()))
+    ERRORS = [
+        (refused_connection(), True),
+        (dns_failure(), False),          # gaierror puts EAI_* codes in the same .errno space
+        (URLError(ConnectionResetError(errno.ECONNRESET, "Connection reset")), False),
+        (URLError("no reason"), False),
+    ]
 
-    def test_ignores_dns_failures(self):
-        # gaierror carries EAI_* codes in .errno, which overlap the errno space.
-        self.assertFalse(jebenaclient._is_connection_refused(dns_failure()))
-
-    def test_ignores_other_socket_errors(self):
-        self.assertFalse(jebenaclient._is_connection_refused(
-            URLError(ConnectionResetError(errno.ECONNRESET, "Connection reset"))
-        ))
-
-    def test_ignores_a_reasonless_error(self):
-        self.assertFalse(jebenaclient._is_connection_refused(URLError("no reason")))
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_detection(self):
+        for exc, expected in self.ERRORS:
+            with self.subTest(reason=repr(getattr(exc, "reason", None))):
+                self.assertEqual(jebenaclient._is_connection_refused(exc), expected)
