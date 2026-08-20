@@ -7,6 +7,7 @@ stand-in for urlopen, so no network and no live server is needed.
 
 import errno
 import io
+import json
 import socket
 import unittest
 from http.client import RemoteDisconnected
@@ -53,7 +54,13 @@ class ScriptedUrlopen:
     def __init__(self, *outcomes):
         self.outcomes = list(outcomes)
         self.scripted = list(outcomes)
+        self.requests = []
         self.calls = 0
+
+    @property
+    def payloads(self):
+        """Return each sent request body, decoded from JSON."""
+        return [json.loads(request.data.decode("utf-8")) for request in self.requests]
 
     def close(self):
         """Close every scripted HTTPError, used or not, to keep test output quiet."""
@@ -61,8 +68,9 @@ class ScriptedUrlopen:
             if hasattr(outcome, "close"):
                 outcome.close()
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, request=None, *args, **kwargs):
         self.calls += 1
+        self.requests.append(request)
         if not self.outcomes:
             raise AssertionError(
                 "urlopen was called %s times; the test only scripted fewer outcomes"
@@ -74,8 +82,8 @@ class ScriptedUrlopen:
         return outcome
 
 
-class RetryContractTestCase(unittest.TestCase):
-    """Exercise _execute_gql_query's retry decisions."""
+class ScriptedSendMixin:
+    """Provides send(), which drives _execute_gql_query against a scripted urlopen."""
 
     MUTATION = "mutation { doThing }"
     QUERY = "query { me }"
@@ -83,6 +91,7 @@ class RetryContractTestCase(unittest.TestCase):
     def send(self, query, *outcomes, **kwargs):
         """Run one query against a scripted urlopen; return (send_count, result)."""
         scripted = ScriptedUrlopen(*outcomes)
+        self.scripted = scripted
         with mock.patch.object(jebenaclient, "urlopen", scripted), \
                 mock.patch.object(jebenaclient.time, "sleep"):
             try:
@@ -99,6 +108,10 @@ class RetryContractTestCase(unittest.TestCase):
             finally:
                 scripted.close()
         return scripted.calls, result
+
+
+class RetryContractTestCase(ScriptedSendMixin, unittest.TestCase):
+    """Exercise _execute_gql_query's retry decisions."""
 
     # -- Ambiguous failures must never be retried for a mutation ---------------
 
@@ -156,6 +169,12 @@ class RetryContractTestCase(unittest.TestCase):
             http_error(503),
             http_error(503),
             FakeResponse()
+        )
+        self.assertEqual(sends, 1)
+
+    def test_named_mutation_is_not_retried(self):
+        sends, _ = self.send(
+            "mutation UpdateUser { x }", http_error(503), http_error(503), FakeResponse()
         )
         self.assertEqual(sends, 1)
 
@@ -239,6 +258,12 @@ class QueryScannerTestCase(unittest.TestCase):
         self.assert_not_retry_safe("MUTATION { doThing }")
         self.assert_not_retry_safe("  \n mutation($a: String) { doThing }")
 
+    def test_named_mutations_are_not_retry_safe(self):
+        self.assert_not_retry_safe("mutation UpdateUser { x }")
+        self.assert_not_retry_safe("mutation UpdateUser($id: ID!) { x }")
+        self.assert_not_retry_safe("mutation {}")
+        self.assert_not_retry_safe("mutation{}")
+
     def test_mutations_behind_ignored_tokens_are_not_retry_safe(self):
         # A leading comment or BOM must not disguise a mutation as a query:
         self.assert_not_retry_safe("# Create the record\nmutation CreateThing { x }")
@@ -266,6 +291,40 @@ class QueryScannerTestCase(unittest.TestCase):
         self.assert_retry_safe("query mutationsById { x }")
         self.assert_not_retry_safe("mutationLike { x }")
         self.assert_not_retry_safe("queryFoo { x }")
+
+
+class RequestPayloadTestCase(ScriptedSendMixin, unittest.TestCase):
+    """Exercise how the outbound GQL request body is serialized."""
+
+    def sent_payload(self, **kwargs):
+        """Send one successful query and return the request body that went out."""
+        self.send(self.QUERY, FakeResponse(), **kwargs)
+        return self.scripted.payloads[0]
+
+    def test_absent_variables_serialize_as_an_empty_map(self):
+        # GQL defines "variables" as a map; an empty list is invalid per spec.
+        self.assertEqual(self.sent_payload()["variables"], {})
+
+    def test_explicit_variables_are_preserved(self):
+        payload = self.sent_payload(variables={"someUUID": "abc", "count": 2})
+        self.assertEqual(payload["variables"], {"someUUID": "abc", "count": 2})
+
+    def test_explicitly_empty_variables_are_left_alone(self):
+        self.assertEqual(self.sent_payload(variables={})["variables"], {})
+
+    def test_falsy_variable_values_survive(self):
+        # A dict of falsy values is still a real variable map and must not be dropped.
+        payload = self.sent_payload(variables={"flag": False, "count": 0, "name": ""})
+        self.assertEqual(payload["variables"], {"flag": False, "count": 0, "name": ""})
+
+    def test_operation_name_is_sent_only_when_given(self):
+        self.assertNotIn("operationName", self.sent_payload())
+        self.assertEqual(
+            self.sent_payload(operation_name="getName")["operationName"], "getName"
+        )
+
+    def test_query_is_sent_verbatim(self):
+        self.assertEqual(self.sent_payload()["query"], self.QUERY)
 
 
 class ConnectionRefusedDetectionTestCase(unittest.TestCase):
