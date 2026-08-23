@@ -1,10 +1,7 @@
 #!/usr/bin/env python3  # noqa -- the hash-bang line here allows for direct script execution
 
-# While we call for python3, we do need to support Python 2.7 for a bit longer:
-from __future__ import print_function
-
 """
-A very simply GQL Client for the Jebena API Server.
+A very simple GQL Client for the Jebena API Server.
 
 Key features:
   * Support for usage via both command-line and python import
@@ -31,7 +28,7 @@ When running in Python, we recommend setting the operation_name for logging:
 For GQL Schema help, see documentation on the Jebena API Server
 by visiting (using a web browser) the API endpoint you are using.
 
-Example of a simply GQL query:
+Example of a simple GQL query:
     query { me { person { displayName } } }
 
 Queries with variables are also supported by "wrapping" your query like so:
@@ -75,8 +72,14 @@ is available by calling get_last_run_trace_id()
 # 0.9.1  20210813: Re-work logger to add NullHandler for py2 reasons
 # 0.9.2  20230222: Improve timeout handling error messages, for clarity
 # 0.9.3  20240923: Add timeout and hint on socket error, for more clarity on timeout cases
-__version__ = "0.9.3"
+# 0.10.0 20260818: Drop Python 2.7 support (Python 3.8+ only); retry mutations on
+#                  a refused connection; move packaging to pyproject.toml;
+#                  send GQL "variables" as a map; quieter HTTP error logging.
+# 0.10.1 20260820: Decide mutation retries per failure rather than widening the
+#                  budget; skip GQL ignored tokens when classifying a document.
+__version__ = "0.10.1"
 
+import errno
 import json
 import logging
 import os
@@ -85,34 +88,15 @@ import socket
 import ssl
 import sys
 import time
+from http.client import HTTPException, RemoteDisconnected
+from json import JSONDecodeError
 from threading import Timer
+from typing import NoReturn, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
-# Python 2 compatibility:
-try:
-    from http.client import RemoteDisconnected
-except ImportError:
-    from httplib import BadStatusLine as RemoteDisconnected  # Py 2
-try:
-    from json.decoder import JSONDecodeError as json_JSONDecodeError
-except ImportError:
-    # In Python 2, json.loads() raises this instead of JSONDecodeError:
-    json_JSONDecodeError = ValueError  # Py 2
-try:
-    from urllib.parse import urlparse
-except ImportError:
-    from urlparse import urlparse  # Py 2
-try:
-    import urllib.request as urllib_request
-    from urllib.error import HTTPError as urllib_HTTPError
-    from urllib.error import URLError as urllib_URLError
-    from urllib.request import urlopen
-except ImportError:
-    import urllib2 as urllib_request  # Py 2
-    from urllib2 import HTTPError as urllib_HTTPError
-    from urllib2 import URLError as urllib_URLError
-    from urllib2 import urlopen  # Py 2
-
-__LOGGER = None  # See __get_logger()
+LOGGER = logging.getLogger(__name__)
 __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None  # See get_last_run_trace_id()
 __MAX_RUN_TIME_IN_SECONDS = 60 * 5
 if os.getenv('JEBENA_CLIENT_TIMEOUT'):
@@ -136,18 +120,17 @@ class JebenaCliGQLPermissionDenied(JebenaCliException):
 
 
 def run_query(
-        query,
-        operation_name=None,
-        variables=None,
-        api_endpoint=None,
-        api_key_name=None,
-        api_secret_key=None,
-        allow_insecure_https=False,
-        allow_retries_on_mutations=False,
-        return_instead_of_raise_on_errors=False,
-        skip_logging_transient_errors=False
-):
-    # type: (str, str, dict, str, str, str, bool, bool, bool, bool) -> dict
+        query: str,
+        operation_name: Optional[str] = None,
+        variables: Optional[dict] = None,
+        api_endpoint: Optional[str] = None,
+        api_key_name: Optional[str] = None,
+        api_secret_key: Optional[str] = None,
+        allow_insecure_https: bool = False,
+        allow_retries_on_mutations: bool = False,
+        return_instead_of_raise_on_errors: bool = False,
+        skip_logging_transient_errors: bool = False
+) -> dict:
     """Send a GQL query to the Jebena API Server and return the server reply.
 
     OS Environ variables should be set for JEBENA_API_KEY_NAME, JEBENA_API_SECRET_KEY,
@@ -239,15 +222,15 @@ def run_query(
         # Wrapped:   {"query": query; "variables": {variables...}}
         try:
             wrapped_query = json.loads(query)
-            __get_logger().debug("Parsing wrapped query")
+            LOGGER.debug("Parsing wrapped query")
             if "query" in wrapped_query:
                 query = wrapped_query["query"]
             if "variables" in wrapped_query:
                 variables = wrapped_query["variables"]
             if "operationName" in wrapped_query:
                 operation_name = wrapped_query["operationName"]
-        except Exception:  # noqa
-            # For Python 2 compatibility: don't try to catch 'json.decoder.JSONDecodeError'
+        except (JSONDecodeError, TypeError):
+            # Not a wrapped query (or not a JSON object); use the input as a plain query.
             pass
 
     parsed_response = _execute_gql_query(
@@ -267,7 +250,7 @@ def run_query(
 
         if "errors" in parsed_response:
             exception_type = JebenaCliGQLException
-            __get_logger().error(
+            LOGGER.error(
                 "GQL response includes an error. Part of the query may have succeeded.\n"
                 " *** The original query was:\n%s\n\n"
                 " *** The full response was:\n%s\n\n",
@@ -281,12 +264,12 @@ def run_query(
                 error_messages.append(error["message"])
                 if "errorType" in error and error["errorType"] == "permissionDenied":
                     exception_type = JebenaCliGQLPermissionDenied
-                __get_logger().error(
+                LOGGER.error(
                     " *** GQL error #%s: %s\n",
                     error_count,
                     error["message"].rstrip()
                 )
-            __get_logger().error("For GraphQL schema, see Docs tab at %sdocs/graphiql", api_endpoint)
+            LOGGER.error("For GraphQL schema, see Docs tab at %sdocs/graphiql", api_endpoint)
             raise exception_type(
                 "GQL errors encountered (%s)" % '; '.join(error_messages)[0:512]
             )
@@ -295,7 +278,7 @@ def run_query(
     return parsed_response
 
 
-def get_last_run_trace_id():
+def get_last_run_trace_id() -> Optional[str]:
     """
     Return the Jebena API Server's trace id for the last call to run_query().
 
@@ -304,23 +287,81 @@ def get_last_run_trace_id():
 
     :return: Most recent call to run_query()'s trace id
     """
-    global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
     return __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
 
 
+# Characters GraphQL treats as "ignored tokens" and permits before the first real
+# token of a document: whitespace, commas, and a leading unicode BOM. NB: str.lstrip()
+# alone will not remove the BOM, since \ufeff is not whitespace to Python.
+__GQL_IGNORED_CHARACTERS = " \t\r\n\f\v,\ufeff"
+
+
+def _strip_leading_gql_ignored_tokens(query: str) -> str:
+    """Return the query with any leading GQL ignored tokens and comments removed."""
+    remainder = query
+    while True:
+        remainder = remainder.lstrip(__GQL_IGNORED_CHARACTERS)
+        if not remainder.startswith("#"):
+            return remainder
+        # GQL comments run to the end of the line and may precede the first real token:
+        end_of_line = remainder.find("\n")
+        if end_of_line == -1:
+            return ""
+        remainder = remainder[end_of_line + 1:]
+
+
+def _is_query_retry_safe(query: str) -> bool:
+    """Return True only when a document is confidently incapable of writing.
+
+    Re-sending is safe only for documents that cannot mutate data, so this
+    deliberately fails closed: anything not positively recognized as a query --
+    including anything we cannot confidently scan -- is treated as a mutation and
+    gets a single attempt. Being wrong in that direction costs a retry on a read;
+    being wrong in the other direction risks a duplicate write.
+
+    NB: a document whose first definition is a fragment is therefore treated as
+    unsafe, even when the operation it precedes is a query.
+    """
+    document = _strip_leading_gql_ignored_tokens(query)
+    if document.startswith("{"):
+        # Anonymous shorthand query, e.g. "{ me { person { displayName } } }". A
+        # wrapped-query JSON object also starts with "{", and may well wrap a
+        # mutation, so require an inner token that could begin a selection set:
+        inner = _strip_leading_gql_ignored_tokens(document[1:])
+        return bool(inner) and not inner.startswith(('"', "'"))
+    if not document.lower().startswith("query"):
+        return False
+    remainder = document[len("query"):]
+    # Require a separator, so that "queryFoo { ... }" is not read as a query:
+    return not remainder or not (remainder[0].isalnum() or remainder[0] == "_")
+
+
+def _is_connection_refused(exc: URLError) -> bool:
+    """Return True when a URLError was caused by the connection being refused.
+
+    ECONNREFUSED means the peer answered our TCP SYN with a RST: no socket was
+    ever opened and no bytes were ever sent, so the request provably did not run.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, socket.gaierror):
+        # DNS failures carry EAI_* codes in .errno, which share a number space
+        # with the errno codes we're testing for here. Never confuse the two.
+        return False
+    return getattr(reason, "errno", None) == errno.ECONNREFUSED
+
+
 def _execute_gql_query(
-        api_endpoint,
-        query,
-        operation_name=None,
-        variables=None,
-        allow_insecure_https=False,
-        api_key_name=None,
-        api_secret_key=None,
-        retries_allowed=2,
-        allow_retries_on_mutations=False,
-        skip_logging_transient_errors=False
-):
-    # type: (str, str, str, dict, bool, str, str, int, bool) -> dict
+        api_endpoint: str,
+        query: str,
+        operation_name: Optional[str] = None,
+        variables: Optional[dict] = None,
+        allow_insecure_https: bool = False,
+        api_key_name: Optional[str] = None,
+        api_secret_key: Optional[str] = None,
+        retries_allowed: int = 2,
+        allow_retries_on_mutations: bool = False,
+        skip_logging_transient_errors: bool = False
+) -> dict:
     """Send a GQL query to the server and return the GQL response."""
     if not api_key_name:
         raise JebenaCliMissingKeyException(
@@ -330,8 +371,10 @@ def _execute_gql_query(
         raise JebenaCliMissingKeyException(
             "Missing API Secret Key (Try setting ENV variable JEBENA_API_SECRET_KEY)"
         )
-    if not variables:
-        variables = []
+    if variables is None:
+        # NB: GQL defines "variables" as a map; an empty list here is invalid per spec
+        # and only ever worked because the server tolerated it.
+        variables = {}
     data = {
         "query": query,
         "variables": variables,
@@ -344,11 +387,6 @@ def _execute_gql_query(
         "Content-Type": "application/json",
         "User-Agent": "jebena-cli-tool/%s" % __version__,
     }
-    is_query_a_mutation = False
-    if query.split(None, 2)[0].lower() == 'mutation':
-        # NB: avoid split()'s kwargs for Python 2 compatibility.
-        # In split() 'None' is separator of whitespace and 2 is maxsplit
-        is_query_a_mutation = True
     try:
         request_payload = json.dumps(data).encode("utf-8")
     except TypeError as exc:
@@ -359,45 +397,60 @@ def _execute_gql_query(
         raise JebenaCliException("Invalid API Endpoint %s" % api_endpoint)
     # By convention, our gql access point is under a sub-path of the API endpoint:
     gql_endpoint = "%sgql/" % api_endpoint
-    __get_logger().debug("Request URL: %s", gql_endpoint)
-    __get_logger().debug("Request body:\n%s\n", request_payload)
-    req = urllib_request.Request(
+    LOGGER.debug("Request URL: %s", gql_endpoint)
+    LOGGER.debug("Request body:\n%s\n", request_payload)
+    req = Request(
         gql_endpoint,
         data=request_payload,
         headers=headers
     )
 
-    # Send and return response -- with a short retry / delay loop for non-mutation
-    # queries to give some support to network hiccups, server rate-limiting, or
-    # individual backend-node issues.
-    if is_query_a_mutation and not allow_retries_on_mutations:
-        attempts_allowed = 1
-    else:
-        attempts_allowed = 1 + retries_allowed
+    # Send and return response -- with a short retry / delay loop to give some support
+    # to network hiccups, server rate-limiting, or individual backend-node issues.
+    #
+    # A mutation that reached the server may have applied, so re-sending one risks a
+    # duplicate write. Mutations therefore get a single attempt, with one exception:
+    # a failure that is provably pre-send (see _is_connection_refused) cannot have
+    # applied anything, so it earns a retry.
+    #
+    # That exception is evaluated per failure and never folded into attempts_allowed.
+    # Widening the budget after one refused connection would let a *later*, ambiguous
+    # failure -- a timeout or 503, arriving after the request did reach the server --
+    # spend the retry it bought, which is exactly the duplicate write this guards.
+    attempts_allowed = 1 + retries_allowed
+    retries_are_safe_for_this_query = allow_retries_on_mutations or _is_query_retry_safe(query)
     attempts_tried = 0
     retry_delay_constant_delay = 5
     retry_delay_next_attempt_extra_delay = 0
     retry_delay_factor = 3
 
-    def _log_and_raise_or_retry(log_message, *args):
-        # type: (str, str) -> None
-        """Log error and either return if retries allowed or raise."""
+    def _log_and_raise_or_retry(
+            log_message: str,
+            *args: object,
+            failure_was_before_send: bool = False
+    ) -> None:
+        """Log error and either return if a retry is allowed or raise.
+
+        :param failure_was_before_send: True when this specific failure proves the
+        request never reached the server, which makes a retry safe even for a mutation.
+        """
+        if not (retries_are_safe_for_this_query or failure_was_before_send):
+            _log_and_raise(log_message, *args)
         if attempts_tried < attempts_allowed:
             if not skip_logging_transient_errors:
-                __get_logger().warning(log_message, *args)
+                LOGGER.warning(log_message, *args)
             return
         _log_and_raise(log_message, *args)
 
-    def _log_and_raise(log_message, *args):
-        # type: (str, str) -> "NoReturn"  # noqa
+    def _log_and_raise(log_message: str, *args: object) -> NoReturn:
         """Log error and raise now."""
         if not skip_logging_transient_errors:
-            __get_logger().error(log_message, *args)
+            LOGGER.error(log_message, *args)
         raise JebenaCliException(log_message % args)
 
     while attempts_tried < attempts_allowed:
         attempts_tried += 1
-        __get_logger().debug("Sending query; attempt %s of %s", attempts_tried, attempts_allowed)
+        LOGGER.debug("Sending query; attempt %s of %s", attempts_tried, attempts_allowed)
         if attempts_tried > 1:
             # When re-attempting query, issue a warning and wait a bit before retrying:
             retry_delay = retry_delay_constant_delay + \
@@ -405,7 +458,7 @@ def _execute_gql_query(
                           retry_delay_factor ** attempts_tried
             retry_delay_next_attempt_extra_delay = 0
             if not skip_logging_transient_errors:
-                __get_logger().warning(
+                LOGGER.warning(
                     "Jebena client failed to fetch from %s; retry in %s seconds; %s attempts left.",
                     api_endpoint,
                     retry_delay,
@@ -417,24 +470,25 @@ def _execute_gql_query(
         try:
             context = None
             if allow_insecure_https:
-                context = ssl.SSLContext(ssl.PROTOCOL_TLS)  # Pass ssl.PROTOCOL_TLS for Py 2.7 compatibility
+                # Accept self-signed or mismatched certificates (localhost / dev endpoints):
+                context = ssl.create_default_context()
+                context.check_hostname = False  # Must be cleared before setting CERT_NONE.
+                context.verify_mode = ssl.CERT_NONE
             # NB: Set an upper-bound run time with timeout to prevent process hangs on network issues, otherwise
             # clients can hang indefinitely in certain network conditions:
             # NB: Mark urlopen() call with 'nosec' to acknowledge handling file:/ condition:
-            __get_logger().debug("Calling urlopen(...)")
+            LOGGER.debug("Calling urlopen(...)")
             response = urlopen(
                 req,
                 context=context,
                 timeout=__MAX_RUN_TIME_IN_SECONDS
             )  # nosec
-            __get_logger().debug("Finished urlopen(...)")
+            LOGGER.debug("Finished urlopen(...)")
             global __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY
-            __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = None
-            try:
-                __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = response.info()["X-Log-Trace-ID"]
-                __get_logger().debug("Jebena Trace ID: %s", __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY)
-            except BaseException:
-                pass
+            # HTTPMessage.__getitem__ returns None for a header the server didn't send,
+            # so no guard is needed here:
+            __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY = response.info()["X-Log-Trace-ID"]
+            LOGGER.debug("Jebena Trace ID: %s", __JEBENA_TRACE_ID_OF_LAST_RUN_QUERY)
             try:
                 response_string = response.read().decode("utf-8")
             except Exception as exc:
@@ -447,8 +501,8 @@ def _execute_gql_query(
                 )
             try:
                 return json.loads(response_string)
-            except json_JSONDecodeError:
-                __get_logger().debug("Unable to decode response string:\n%s", response_string)
+            except JSONDecodeError:
+                LOGGER.debug("Unable to decode response string:\n%s", response_string)
                 raise JebenaCliGQLException(
                     "Invalid GQL response from %s (unable to parse '%s...'; Jebena Trace ID: %s)" %
                     (api_endpoint,
@@ -466,7 +520,7 @@ def _execute_gql_query(
             )
             continue
 
-        except urllib_HTTPError as exc:  # qa
+        except HTTPError as exc:  # noqa
             if exc.code == 401:
                 # Regardless of retries left, always raise when using an unauthorized key:
                 time.sleep(1)  # Delay a little on 401; in case we are called inside a loop
@@ -485,31 +539,24 @@ def _execute_gql_query(
                 retry_delay_next_attempt_extra_delay = 10
                 continue
 
-            # Response document may be a Jebena API Server response with info:
-            response = "(Non-UTF-8 response)"
+            # The response document may be a Jebena API Server error document, like so:
+            #    {
+            #      "details": {"errorType":"http",
+            #                  "message":"Api-key not found.",
+            #                  "status":401},
+            #      "message":"Api-key not found.",
+            #      "status":401
+            #    }
+            # The server's own message is already in there, so we surface the body
+            # verbatim below rather than re-formatting it.
+            response_body = "(Non-UTF-8 response)"
             try:
-                response = exc.read().decode("utf-8", "replace")
-                # response can potentially be a JSON doc from Jebena API server, like so:
-                #    {
-                #      "details": {"errorType":"http",
-                #                  "message":"Api-key not found.",
-                #                  "status":401},
-                #      "message":"Api-key not found.",
-                #      "status":401
-                #    }
-                # Try parsing the response to see if we have an error that we can wrap and make
-                # more understandable in the context of our client:
-                response_data = json.loads(response)
-                __get_logger().critical(
-                    "Please file a bug report at "
-                    "https://github.com/jebena/jebena-python-client/issues for this:\n"
-                    "We should add handling for this error:\n%s", response_data
-                )
-            except BaseException:  # noqa
-                # NB: for Py 2.7 support, we need to catch something that exists in that version.
+                response_body = exc.read().decode("utf-8", "replace")
+            except (OSError, HTTPException):
+                # Body could not be read off the socket; the status code will have to do.
                 pass
-            response_snippet = response[0:512]
-            if len(response) > 512:
+            response_snippet = response_body[0:512]
+            if len(response_body) > 512:
                 response_snippet += "..."
 
             if exc.code in [502, 503]:
@@ -525,18 +572,25 @@ def _execute_gql_query(
             # For now, we're just printing out the first KB of the raw JSON response.
             _log_and_raise(
                 "Unknown Error; the Jebena API Server at %s has returned "
-                "an unknown error (HTTP code: %s)\nResponse body:\n%s",
+                "an unknown error (HTTP code: %s)\nResponse body:\n%s\n"
+                "If this client should handle this error more gracefully, please file a bug at "
+                "https://github.com/jebena/jebena-python-client/issues",
                 api_endpoint,
                 exc.code,
                 response_snippet
             )
 
-        except urllib_URLError as exc:  # noqa
+        except URLError as exc:  # noqa
+            # "Connection refused" means the TCP connection was never established, so
+            # the server provably never saw this request; there is nothing to duplicate.
+            # Every other failure here is ambiguous -- a timeout or a dropped connection
+            # may well have left a mutation applied server-side.
             _log_and_raise_or_retry(
                 "URL Error (%s); check that the network is accessible and that "
                 "the hostname is correct in Jebena API Server endpoint '%s'",
                 str(exc),
-                api_endpoint
+                api_endpoint,
+                failure_was_before_send=_is_connection_refused(exc)
             )
             continue
 
@@ -550,12 +604,11 @@ def _execute_gql_query(
     # We shouldn't actually ever hit this condition, based on our above try/catch code,
     # but any programming error above could lead to falling off of the edge:
     raise JebenaCliException(
-        "Unknown client issue when connection to Jebena API Server at %s" % api_endpoint
+        "Unknown client issue when connecting to Jebena API Server at %s" % api_endpoint
     )
 
 
-def read_query_and_return_response():
-    # type: () -> str
+def read_query_and_return_response() -> str:
     """Read a query from STDIN (prompting if necessary) and return the server's response."""
     try:
         gql_query = read_from_stdin(
@@ -574,8 +627,7 @@ def read_query_and_return_response():
     return json.dumps(gql_response, indent=2, sort_keys=True)
 
 
-def read_from_stdin(user_prompt=None):
-    # type: (str) -> str
+def read_from_stdin(user_prompt: Optional[str] = None) -> str:
     """Read from stdin until Ctrl-D, "." on empty line, or EOF occurs."""
     # If in a terminal, print some opening help:
     if sys.stdin.isatty() and user_prompt is not None:
@@ -606,26 +658,13 @@ def read_from_stdin(user_prompt=None):
     return "".join(reads)
 
 
-def __get_logger():
-    """Return a python logger for emitting logs."""
-    global __LOGGER
-    if not __LOGGER:
-        __LOGGER = logging.getLogger(__name__)
-        # We add a NullHandler() to avoid spurious "No handler found" errors in Python 2.
-        # We lazy-load the logger here in order to give any other code importing us time to set up
-        # logging config. (NB: this lazy-load is possibly unneeded, now that we've found the NullHandler approach.)
-        if sys.version_info[0] == 2:
-            __LOGGER.addHandler(logging.NullHandler())
-    return __LOGGER
-
-
-def __exit_client():
+def __exit_client() -> NoReturn:
     """Terminates python with non-zero exit code when we're run as a command-line."""
     print(
         "Error: Request terminated. Jebena client exceeded max run time (%s seconds). "
         "This typically means the API server was unable to generate a response within a reasonable time. "
         "Check that the GQL query isn't over-fetching. It's also possible that more involved API calls may "
-        "take longer than expected, in which case try temporarily increasing the timeout by setting the"
+        "take longer than expected, in which case try temporarily increasing the timeout by setting the "
         "ENV variable 'JEBENA_CLIENT_TIMEOUT' in your shell: export JEBENA_CLIENT_TIMEOUT=%s"
         % (__MAX_RUN_TIME_IN_SECONDS, __MAX_RUN_TIME_IN_SECONDS * 2),
         file=sys.stderr
@@ -633,7 +672,7 @@ def __exit_client():
     os._exit(3)  # noqa
 
 
-def main():
+def main() -> None:
     """
     Read a single query from STDIN, execute it, and print the server response to STDOUT.
 
