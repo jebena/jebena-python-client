@@ -128,10 +128,24 @@ where loading secrets in the ENV is not practical.
     be kept securely stored!
 
 
+### Retries and timeouts
+
+Failed queries are retried a few times. Mutations are retried only on errors known to have
+been raised before the server ran any application logic, since a mutation that reached the
+server may already have applied and re-sending it risks a duplicate write. Pass
+`allow_retries_on_mutations=True` to retry regardless, but only for mutations you know are
+idempotent. When the server sends a `Retry-After`, that sets the delay.
+
+`JEBENA_CLIENT_TIMEOUT` (default 300 seconds) is the socket timeout applied to each
+attempt. It bounds inactivity rather than total transfer time, so a server that trickles a
+response slowly can exceed it; the command-line entry point has a separate watchdog on
+total run time.
+
 ### Working with Jebena Trace IDs
 
 The Jebena API Server provides a "Jebena Trace ID" that can be used for tracing
 the backend server's logs for any given request. This is provided as an HTTP header to clients.
 
-Calling `jebenaclient.get_last_run_trace_id()` after any call to `jebenaclient.run_query()` will provide the Jebena Trace ID,
-which can then be used by server developers (e.g. `jebena aws logs trace <id>`)
+Calling `jebenaclient.get_last_run_trace_id()` after a call to `jebenaclient.run_query()` will provide that call's Jebena Trace ID,
+which can then be used by server developers (e.g. `jebena aws logs trace <id>`).
+It is `None` when the server did not return one.
